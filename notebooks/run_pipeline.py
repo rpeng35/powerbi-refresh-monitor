@@ -165,7 +165,7 @@ else:
 # COMMAND ----------
 
 if alert_cfg.get("enabled", False) and all_records:
-    dispatcher = AlertDispatcher(slack_webhook_url=alert_cfg.get("slack_webhook_url"))
+    dispatcher = AlertDispatcher(teams_webhook_url=alert_cfg.get("teams_webhook_url"))
 
     all_alerts = []
 

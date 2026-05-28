@@ -36,14 +36,14 @@ class Alert:
 class AlertDispatcher:
     """Dispatches alerts to configured channels."""
 
-    def __init__(self, slack_webhook_url: str | None = None):
-        self._slack_webhook_url = slack_webhook_url
+    def __init__(self, teams_webhook_url: str | None = None):
+        self._teams_webhook_url = teams_webhook_url
 
     def dispatch(self, alert: Alert) -> None:
         """Send an alert to all configured channels."""
         self._log_alert(alert)
-        if self._slack_webhook_url:
-            self._send_slack(alert)
+        if self._teams_webhook_url:
+            self._send_teams(alert)
 
     def _log_alert(self, alert: Alert) -> None:
         log_level = logging.CRITICAL if alert.severity == "critical" else logging.WARNING
@@ -57,44 +57,60 @@ class AlertDispatcher:
             alert.message,
         )
 
-    def _send_slack(self, alert: Alert) -> None:
-        severity_emoji = {
-            "critical": ":red_circle:",
-            "warning": ":large_yellow_circle:",
-            "info": ":large_blue_circle:",
+    def _send_teams(self, alert: Alert) -> None:
+        severity_color = {
+            "critical": "attention",
+            "warning": "warning",
+            "info": "good",
         }
-        emoji = severity_emoji.get(alert.severity, ":white_circle:")
+        color = severity_color.get(alert.severity, "default")
 
-        blocks = [
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": f"{emoji} Power BI Refresh Alert — {alert.alert_type.replace('_', ' ').title()}",
-                },
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Severity:* {alert.severity.upper()}"},
-                    {"type": "mrkdwn", "text": f"*Dataset:* {alert.dataset_name}"},
-                    {"type": "mrkdwn", "text": f"*Workspace:* {alert.workspace_name}"},
-                    {"type": "mrkdwn", "text": f"*Time:* {alert.timestamp}"},
-                ],
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Details:* {alert.message}"},
-            },
-        ]
+        # Adaptive Card payload for Microsoft Teams incoming webhook
+        card = {
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "contentUrl": None,
+                    "content": {
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "type": "AdaptiveCard",
+                        "version": "1.4",
+                        "body": [
+                            {
+                                "type": "TextBlock",
+                                "size": "Large",
+                                "weight": "Bolder",
+                                "text": f"Power BI Refresh Alert \u2014 {alert.alert_type.replace('_', ' ').title()}",
+                                "style": "heading",
+                                "color": color,
+                            },
+                            {
+                                "type": "FactSet",
+                                "facts": [
+                                    {"title": "Severity", "value": alert.severity.upper()},
+                                    {"title": "Dataset", "value": alert.dataset_name},
+                                    {"title": "Workspace", "value": alert.workspace_name},
+                                    {"title": "Time (UTC)", "value": alert.timestamp},
+                                ],
+                            },
+                            {
+                                "type": "TextBlock",
+                                "text": alert.message,
+                                "wrap": True,
+                            },
+                        ],
+                    },
+                }
+            ],
+        }
 
-        payload = {"blocks": blocks}
         try:
-            resp = requests.post(self._slack_webhook_url, json=payload, timeout=10)
+            resp = requests.post(self._teams_webhook_url, json=card, timeout=10)
             resp.raise_for_status()
-            logger.info("Slack alert sent successfully.")
+            logger.info("Teams alert sent successfully.")
         except requests.RequestException as exc:
-            logger.error("Failed to send Slack alert: %s", exc)
+            logger.error("Failed to send Teams alert: %s", exc)
 
 
 def check_refresh_failures(

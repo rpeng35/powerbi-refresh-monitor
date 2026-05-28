@@ -100,7 +100,7 @@ Edit `config/datasets.json` to add your workspace and dataset IDs:
 ### 3. Configure Pipeline Settings
 Edit `config/pipeline_config.json`:
 - Set `delta_table.catalog` and `delta_table.schema` to your Unity Catalog location.
-- Optionally configure `alerting.slack_webhook_url` for Slack notifications.
+- Optionally configure `alerting.teams_webhook_url` for Microsoft Teams notifications.
 
 ### 4. Create the Delta Table
 Run the `notebooks/setup_table.py` notebook once to create the table.
@@ -130,7 +130,7 @@ The pipeline includes three alert checks that run after each ingestion:
 
 | Alert | Trigger | Default Threshold |
 |---|---|---|
-| **Refresh Failure** | Any dataset with `status = 'Failed'` | Immediate (critical datasets → Slack; non-critical → log) |
+| **Refresh Failure** | Any dataset with `status = 'Failed'` | Immediate (critical datasets → Teams; non-critical → log) |
 | **Duration Anomaly** | Duration > 1.5× the 7-day rolling average | Configurable in `pipeline_config.json` |
 | **Stale Data** | No successful refresh for a critical dataset in 26 hours | Configurable in `pipeline_config.json` |
 

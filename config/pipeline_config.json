@@ -21,7 +21,7 @@
   },
   "alerting": {
     "enabled": true,
-    "slack_webhook_url": null,
+    "teams_webhook_url": null,
     "check_failures": true,
     "check_duration_anomalies": true,
     "check_stale_data": true,
