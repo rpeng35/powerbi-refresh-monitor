@@ -1,0 +1,7 @@
+# Core dependencies (pre-installed on Databricks Runtime, but listed for local dev/CI)
+msal>=1.28.0
+requests>=2.31.0
+python-dateutil>=2.8.0
+
+# Testing (local development only — not needed on Databricks)
+pytest>=7.0.0

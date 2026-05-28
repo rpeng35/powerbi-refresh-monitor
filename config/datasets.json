@@ -1,0 +1,21 @@
+{
+  "_comment": "Configuration registry for monitored Power BI datasets. Update this file to add/remove datasets — no code changes required.",
+  "datasets": [
+    {
+      "workspace_id": "YOUR_WORKSPACE_ID_HERE",
+      "workspace_name": "Finance Reports",
+      "dataset_id": "YOUR_DATASET_ID_HERE",
+      "dataset_name": "Monthly Revenue Model",
+      "is_critical": true,
+      "is_active": true
+    },
+    {
+      "workspace_id": "YOUR_WORKSPACE_ID_HERE",
+      "workspace_name": "Marketing Analytics",
+      "dataset_id": "YOUR_DATASET_ID_HERE",
+      "dataset_name": "Campaign Performance",
+      "is_critical": false,
+      "is_active": true
+    }
+  ]
+}

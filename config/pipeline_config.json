@@ -1,0 +1,32 @@
+{
+  "_comment": "Pipeline configuration. Modify values here instead of editing notebook code.",
+  "delta_table": {
+    "catalog": "your_catalog",
+    "schema": "your_schema",
+    "table_name": "powerbi_refresh_history",
+    "_full_name_note": "Resolved as: {catalog}.{schema}.{table_name}"
+  },
+  "api": {
+    "top_records_per_dataset": 60,
+    "request_timeout_seconds": 30,
+    "max_retries": 3,
+    "backoff_factor": 1.0,
+    "inter_request_delay_seconds": 0.2
+  },
+  "secrets": {
+    "scope": "powerbi-monitor",
+    "tenant_id_key": "tenant-id",
+    "client_id_key": "client-id",
+    "client_secret_key": "client-secret"
+  },
+  "alerting": {
+    "enabled": true,
+    "slack_webhook_url": null,
+    "check_failures": true,
+    "check_duration_anomalies": true,
+    "check_stale_data": true,
+    "duration_anomaly_threshold_multiplier": 1.5,
+    "duration_anomaly_rolling_window_days": 7,
+    "staleness_threshold_hours": 26
+  }
+}
