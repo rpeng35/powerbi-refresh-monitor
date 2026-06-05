@@ -6,6 +6,7 @@ and per-dataset refresh history retrieval.
 """
 
 import logging
+import time
 from typing import Any
 
 import requests
@@ -18,6 +19,14 @@ BASE_URL = "https://api.powerbi.com/v1.0/myorg"
 
 # HTTP status codes that warrant automatic retry
 RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504]
+
+
+def _count_rows(payload: dict[str, Any]) -> int:
+    """Count rows returned by an Execute Queries response (0 if none/malformed)."""
+    try:
+        return len(payload["results"][0]["tables"][0]["rows"])
+    except (KeyError, IndexError, TypeError):
+        return 0
 
 
 class PowerBIClient:
@@ -215,6 +224,60 @@ class PowerBIClient:
                 )
                 return []
             raise
+
+    def execute_dax_query(
+        self,
+        workspace_id: str,
+        dataset_id: str,
+        dax_query: str,
+    ) -> dict[str, Any]:
+        """Execute a DAX query against a dataset and measure round-trip time.
+
+        Calls the *Execute Queries* REST API and times the request. Used for
+        active response-time probing (a no-Log-Analytics alternative).
+
+        Parameters
+        ----------
+        workspace_id : str
+            Power BI workspace (group) ID.
+        dataset_id : str
+            Power BI dataset (semantic model) ID.
+        dax_query : str
+            A DAX query (e.g. ``EVALUATE ROW("x", 1)``).
+
+        Returns
+        -------
+        dict
+            ``{"duration_ms": float, "row_count": int}`` on success.
+
+        Raises
+        ------
+        requests.HTTPError
+            On non-retryable HTTP errors.
+
+        Notes
+        -----
+        The shared retry strategy only auto-retries GET, so this POST is
+        issued once and timed cleanly (auto-retries would inflate timing).
+        """
+        url = f"{BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/executeQueries"
+        body = {
+            "queries": [{"query": dax_query}],
+            "serializerSettings": {"includeNulls": True},
+        }
+
+        start = time.perf_counter()
+        response = self._session.post(
+            url,
+            headers=self._headers,
+            json=body,
+            timeout=self._request_timeout,
+        )
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        response.raise_for_status()
+
+        payload = response.json()
+        return {"duration_ms": duration_ms, "row_count": _count_rows(payload)}
 
     def close(self) -> None:
         self._session.close()

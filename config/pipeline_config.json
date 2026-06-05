@@ -6,6 +6,12 @@
     "table_name": "powerbi_refresh_history",
     "_full_name_note": "Resolved as: {catalog}.{schema}.{table_name}"
   },
+  "query_performance_table": {
+    "catalog": "your_catalog",
+    "schema": "your_schema",
+    "table_name": "powerbi_query_performance",
+    "_full_name_note": "Resolved as: {catalog}.{schema}.{table_name}. Written by notebooks/run_query_probe.py."
+  },
   "api": {
     "top_records_per_dataset": 60,
     "request_timeout_seconds": 30,

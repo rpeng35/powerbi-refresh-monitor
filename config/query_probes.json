@@ -1,0 +1,16 @@
+{
+  "_comment": "Registry of response-time probes. Each probe runs a representative DAX query against a dataset via the Execute Queries API and records the round-trip duration. Keep queries lightweight and identical run-to-run for clean trend comparison.",
+  "_dax_note": "Use a small but representative query. 'EVALUATE ROW(...)' is a near-zero-cost connectivity baseline. For a meaningful report-response benchmark, EVALUATE a key measure with TOPN over a representative filter, e.g. EVALUATE TOPN(100, SUMMARIZECOLUMNS('Date'[Month], \"Revenue\", [Total Revenue])).",
+  "probes": [
+    {
+      "workspace_id": "YOUR_WORKSPACE_ID_HERE",
+      "workspace_name": "Finance Reports",
+      "dataset_id": "YOUR_DATASET_ID_HERE",
+      "dataset_name": "Monthly Revenue Model",
+      "query_label": "revenue_baseline",
+      "dax_query": "EVALUATE ROW(\"probe\", 1)",
+      "is_critical": true,
+      "is_active": false
+    }
+  ]
+}

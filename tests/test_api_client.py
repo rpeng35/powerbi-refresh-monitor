@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from src.api_client import PowerBIClient
+from src.api_client import PowerBIClient, _count_rows
 
 
 class TestPowerBIClient:
@@ -181,3 +181,57 @@ class TestWorkspaceDiscovery:
             client._session = mock_session
             with pytest.raises(requests.HTTPError):
                 client.get_datasets_in_workspace_safe("ws-1", "Test WS")
+
+
+class TestCountRows:
+    def test_counts_rows(self):
+        payload = {"results": [{"tables": [{"rows": [{"a": 1}, {"a": 2}, {"a": 3}]}]}]}
+        assert _count_rows(payload) == 3
+
+    def test_empty_rows(self):
+        payload = {"results": [{"tables": [{"rows": []}]}]}
+        assert _count_rows(payload) == 0
+
+    def test_malformed_returns_zero(self):
+        assert _count_rows({}) == 0
+        assert _count_rows({"results": []}) == 0
+        assert _count_rows({"results": [{}]}) == 0
+
+
+class TestExecuteDaxQuery:
+    SAMPLE_PAYLOAD = {
+        "results": [{"tables": [{"rows": [{"x": 1}, {"x": 2}]}]}]
+    }
+
+    @patch("src.api_client.requests.Session")
+    def test_success_returns_duration_and_rows(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = self.SAMPLE_PAYLOAD
+        mock_response.raise_for_status.return_value = None
+        mock_session.post.return_value = mock_response
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            result = client.execute_dax_query("ws-1", "ds-1", 'EVALUATE ROW("x", 1)')
+
+        assert result["row_count"] == 2
+        assert isinstance(result["duration_ms"], float)
+        assert result["duration_ms"] >= 0
+        # Verify the POST body carried the DAX query.
+        _, kwargs = mock_session.post.call_args
+        assert kwargs["json"]["queries"][0]["query"] == 'EVALUATE ROW("x", 1)'
+
+    @patch("src.api_client.requests.Session")
+    def test_raises_on_http_error(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = requests.HTTPError()
+        mock_session.post.return_value = mock_response
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(requests.HTTPError):
+                client.execute_dax_query("ws-1", "ds-1", "EVALUATE ROW(\"x\", 1)")

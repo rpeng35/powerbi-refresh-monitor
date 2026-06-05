@@ -34,25 +34,29 @@ The pipeline:
 powerbi-refresh-monitor/
 ├── config/
 │   ├── datasets.json          # Registry of monitored workspaces/datasets
-│   ├── pipeline_config.json   # Pipeline settings (table name, API params, alerting)
+│   ├── query_probes.json      # Registry of response-time probes (DAX per dataset)
+│   ├── pipeline_config.json   # Pipeline settings (table names, API params, alerting)
 │   └── workflow_job.json      # Databricks Workflow job definition
 ├── notebooks/
-│   ├── run_pipeline.py        # Main pipeline notebook (daily execution)
+│   ├── run_pipeline.py        # Refresh-history pipeline notebook (daily execution)
+│   ├── run_query_probe.py     # Response-time probe notebook (daily execution)
 │   ├── setup_table.py         # One-time Delta table creation
 │   └── sample_queries.sql     # Analytical SQL queries
 ├── src/
 │   ├── __init__.py
 │   ├── auth.py                # OAuth2 token acquisition via MSAL
-│   ├── api_client.py          # Power BI REST API client with retry logic
+│   ├── api_client.py          # Power BI REST API client (refresh, discovery, executeQueries)
 │   ├── transform.py           # JSON → structured row transformation
-│   ├── delta_ops.py           # Delta table DDL, upsert, and watermark queries
+│   ├── delta_ops.py           # Delta table DDL, upsert, append, and watermark queries
 │   ├── discovery.py           # Workspace-level dataset auto-discovery
+│   ├── query_probe.py         # Active response-time probing (Execute Queries)
 │   └── alerts.py              # Post-ingestion alerting framework
 ├── tests/
 │   ├── __init__.py
 │   ├── test_auth.py
 │   ├── test_api_client.py
 │   ├── test_discovery.py
+│   ├── test_query_probe.py
 │   └── test_transform.py
 ├── requirements.txt
 ├── .gitignore
@@ -140,6 +144,36 @@ Use `config/workflow_job.json` as the job definition:
 - Via API: `POST /api/2.1/jobs/create` with the JSON payload.
 
 Update the `notebook_path` and `email_notifications` fields before deploying.
+
+## Response-Time Probing (no Log Analytics required)
+
+Measuring report/query response time normally requires Azure Log Analytics, which adds a
+usage-based Azure cost and requires Premium/Fabric capacity. As a **near-zero-cost
+alternative**, this repo includes an **active query probe** that measures response time
+directly:
+
+- `notebooks/run_query_probe.py` runs a small, **representative DAX query** against each
+  configured dataset via the **Execute Queries** REST API and records the round-trip
+  duration in the `powerbi_query_performance` Delta table.
+- Cost is just a few seconds of Databricks compute per run — **no per-GB ingestion charges**.
+- Because the same query runs identically each time, you get a clean **apples-to-apples
+  trend** ("did this report get slower over the last 6 weeks?").
+
+### Setup
+1. Have a Power BI admin enable the **"Dataset Execute Queries REST API"** tenant setting
+   for your Service Principal (a permission toggle — **not** a cost), and ensure the SP has
+   dataset access.
+2. Populate `config/query_probes.json` with one entry per dataset to probe, each with a
+   `query_label` and a lightweight `dax_query`. Keep the query identical run-to-run for
+   trend comparison.
+3. Set `query_performance_table.catalog`/`schema` in `config/pipeline_config.json`.
+4. Run `notebooks/run_query_probe.py` (it creates the table on first run). Schedule it
+   daily — or more frequently for finer-grained trends — via a Databricks Workflow.
+
+**Trade-off vs. Log Analytics:** the probe measures a query *you* define, not every real
+user query, so it is a controlled benchmark rather than full real-user telemetry. It is the
+recommended primary method for response-time trending; Log Analytics remains an optional
+later upgrade if full per-user query telemetry is needed.
 
 ## Local Development & Testing
 
