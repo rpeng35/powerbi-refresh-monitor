@@ -11,7 +11,12 @@
     "request_timeout_seconds": 30,
     "max_retries": 3,
     "backoff_factor": 1.0,
-    "inter_request_delay_seconds": 0.2
+    "inter_request_delay_seconds": 0.2,
+    "max_concurrent_requests": 4
+  },
+  "extraction": {
+    "incremental": true,
+    "_comment": "When incremental is true, only records newer than the last stored start_time per dataset are processed. Set to false for a full re-extraction."
   },
   "secrets": {
     "scope": "powerbi-monitor",

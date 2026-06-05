@@ -8,6 +8,7 @@ import pytest
 from src.transform import (
     compute_duration_seconds,
     extract_error_code,
+    filter_records_by_watermark,
     transform_refresh_records,
 )
 
@@ -186,3 +187,71 @@ class TestTransformRefreshRecords:
         row = rows[0]
         assert row["ingestion_timestamp"] is not None
         assert row["ingestion_date"] is not None
+
+
+class TestFilterRecordsByWatermark:
+    def test_none_watermark_returns_all(self):
+        records = [
+            {"requestId": "r1", "startTime": "2024-06-01T08:00:00Z"},
+            {"requestId": "r2", "startTime": "2024-06-02T08:00:00Z"},
+        ]
+        result = filter_records_by_watermark(records, None)
+        assert len(result) == 2
+
+    def test_empty_watermark_returns_all(self):
+        records = [{"requestId": "r1", "startTime": "2024-06-01T08:00:00Z"}]
+        result = filter_records_by_watermark(records, "")
+        assert len(result) == 1
+
+    def test_filters_old_records(self):
+        records = [
+            {"requestId": "old", "startTime": "2024-06-01T08:00:00Z"},
+            {"requestId": "new", "startTime": "2024-06-03T08:00:00Z"},
+        ]
+        result = filter_records_by_watermark(records, "2024-06-02T00:00:00Z")
+        assert len(result) == 1
+        assert result[0]["requestId"] == "new"
+
+    def test_exact_watermark_excluded(self):
+        records = [
+            {"requestId": "exact", "startTime": "2024-06-02T00:00:00Z"},
+        ]
+        result = filter_records_by_watermark(records, "2024-06-02T00:00:00Z")
+        assert len(result) == 0
+
+    def test_record_without_start_time_included(self):
+        records = [
+            {"requestId": "no-time"},
+            {"requestId": "old", "startTime": "2024-06-01T00:00:00Z"},
+        ]
+        result = filter_records_by_watermark(records, "2024-06-02T00:00:00Z")
+        assert len(result) == 1
+        assert result[0]["requestId"] == "no-time"
+
+    def test_all_records_newer(self):
+        records = [
+            {"requestId": "r1", "startTime": "2024-06-05T00:00:00Z"},
+            {"requestId": "r2", "startTime": "2024-06-06T00:00:00Z"},
+        ]
+        result = filter_records_by_watermark(records, "2024-06-01T00:00:00Z")
+        assert len(result) == 2
+
+    def test_all_records_older(self):
+        records = [
+            {"requestId": "r1", "startTime": "2024-06-01T00:00:00Z"},
+            {"requestId": "r2", "startTime": "2024-06-02T00:00:00Z"},
+        ]
+        result = filter_records_by_watermark(records, "2024-06-10T00:00:00Z")
+        assert len(result) == 0
+
+    def test_empty_records(self):
+        result = filter_records_by_watermark([], "2024-06-01T00:00:00Z")
+        assert result == []
+
+    def test_unparseable_start_time_included(self):
+        records = [
+            {"requestId": "bad", "startTime": "not-a-date"},
+            {"requestId": "good", "startTime": "2024-06-05T00:00:00Z"},
+        ]
+        result = filter_records_by_watermark(records, "2024-06-01T00:00:00Z")
+        assert len(result) == 2

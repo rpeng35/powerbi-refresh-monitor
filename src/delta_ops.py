@@ -43,6 +43,45 @@ REFRESH_HISTORY_SCHEMA = StructType(
 )
 
 
+def get_watermarks(spark: SparkSession, table_name: str) -> dict[str, str]:
+    """Return the latest start_time per dataset_id from the Delta table.
+
+    Used for incremental extraction — only records newer than the watermark
+    need to be processed.
+
+    Parameters
+    ----------
+    spark : SparkSession
+    table_name : str
+        Fully qualified Delta table name.
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping of dataset_id to latest start_time (ISO-8601 string).
+        Empty dict if the table doesn't exist or has no data.
+    """
+    try:
+        rows = spark.sql(
+            f"SELECT dataset_id, MAX(start_time) AS latest "
+            f"FROM {table_name} "
+            f"WHERE start_time IS NOT NULL "
+            f"GROUP BY dataset_id"
+        ).collect()
+        return {
+            row.dataset_id: row.latest.isoformat()
+            for row in rows
+            if row.latest is not None
+        }
+    except Exception as exc:
+        logger.warning(
+            "Could not read watermarks from '%s': %s. Running full extraction.",
+            table_name,
+            exc,
+        )
+        return {}
+
+
 def get_create_table_ddl(table_name: str) -> str:
     """Return the DDL statement for creating the refresh history Delta table."""
     return f"""

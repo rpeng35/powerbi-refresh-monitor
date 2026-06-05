@@ -14,10 +14,19 @@ Microsoft Entra ID       Databricks Notebook           Delta Lake
 
 The pipeline:
 1. Acquires an OAuth2 token via MSAL using Service Principal credentials stored in Databricks Secrets.
-2. Calls the Power BI REST API (`Get Refresh History In Group`) for each configured dataset.
-3. Transforms the JSON response — computes durations, extracts error codes, normalizes timestamps.
-4. Upserts into a Delta Lake table using `MERGE INTO` on `request_id` to prevent duplicates.
-5. Runs post-ingestion alert checks for failures, duration anomalies, and stale data.
+2. **Resolves the dataset registry** — explicit dataset entries plus optional workspace-level auto-discovery (`Get Datasets In Group`).
+3. **Loads per-dataset watermarks** from the Delta table for incremental extraction.
+4. Calls the Power BI REST API (`Get Refresh History In Group`) for each dataset **concurrently**, keeping only records newer than the watermark.
+5. Transforms the JSON response — computes durations, extracts error codes, normalizes timestamps.
+6. Upserts into a Delta Lake table using `MERGE INTO` on `request_id` to prevent duplicates.
+7. Runs post-ingestion alert checks for failures, duration anomalies, and stale data.
+
+### Scalability features
+
+- **Workspace-level auto-discovery** — point the registry at a whole workspace and every dataset in it is found automatically; adding a workspace needs no per-report config.
+- **Incremental extraction** — a per-dataset watermark (latest stored `start_time`) means each run only processes refreshes that happened since the last run, so call/processing volume stays flat as history grows.
+- **Concurrent extraction** — a configurable thread pool (`api.max_concurrent_requests`) parallelizes per-dataset API calls; the built-in retry/`Retry-After` handling absorbs throttling (429s).
+- **Partial-failure tolerance** — one failing dataset is logged and skipped without aborting the run.
 
 ## Project Structure
 
@@ -36,12 +45,14 @@ powerbi-refresh-monitor/
 │   ├── auth.py                # OAuth2 token acquisition via MSAL
 │   ├── api_client.py          # Power BI REST API client with retry logic
 │   ├── transform.py           # JSON → structured row transformation
-│   ├── delta_ops.py           # Delta table DDL and upsert operations
+│   ├── delta_ops.py           # Delta table DDL, upsert, and watermark queries
+│   ├── discovery.py           # Workspace-level dataset auto-discovery
 │   └── alerts.py              # Post-ingestion alerting framework
 ├── tests/
 │   ├── __init__.py
 │   ├── test_auth.py
 │   ├── test_api_client.py
+│   ├── test_discovery.py
 │   └── test_transform.py
 ├── requirements.txt
 ├── .gitignore
@@ -81,7 +92,9 @@ In your Databricks workspace:
 - Update the `REPO_ROOT` path in `notebooks/run_pipeline.py` and `notebooks/setup_table.py` to match your Databricks Repos path (e.g., `/Workspace/Repos/your-email/powerbi-refresh-monitor`).
 
 ### 2. Configure Datasets
-Edit `config/datasets.json` to add your workspace and dataset IDs:
+Edit `config/datasets.json`. You can register datasets two ways (mix freely):
+
+**a) Explicit datasets** — full control over names and the `is_critical` flag:
 ```json
 {
   "datasets": [
@@ -97,10 +110,26 @@ Edit `config/datasets.json` to add your workspace and dataset IDs:
 }
 ```
 
+**b) Workspace-level auto-discovery** — monitor every dataset in a workspace without listing each one. Explicit entries take precedence; `exclude_datasets` lets you opt specific datasets out:
+```json
+{
+  "workspaces": [
+    {
+      "workspace_id": "f089354e-8366-4e18-aea3-4cb4a3a50b48",
+      "workspace_name": "Sales Analytics",
+      "is_critical_default": false,
+      "is_active": true,
+      "exclude_datasets": ["<dataset-id-to-skip>"]
+    }
+  ]
+}
+```
+
 ### 3. Configure Pipeline Settings
 Edit `config/pipeline_config.json`:
 - Set `delta_table.catalog` and `delta_table.schema` to your Unity Catalog location.
 - Optionally configure `alerting.teams_webhook_url` for Microsoft Teams notifications.
+- Tune scalability knobs: `api.max_concurrent_requests` (parallel API calls) and `extraction.incremental` (set `false` to force a full re-extraction).
 
 ### 4. Create the Delta Table
 Run the `notebooks/setup_table.py` notebook once to create the table.

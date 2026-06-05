@@ -6,7 +6,6 @@ and per-dataset refresh history retrieval.
 """
 
 import logging
-import time
 from typing import Any
 
 import requests
@@ -139,6 +138,79 @@ class PowerBIClient:
                     "Ensure the Service Principal has Member access.",
                     dataset_name,
                     dataset_id,
+                    workspace_id,
+                )
+                return []
+            raise
+
+    def get_datasets_in_workspace(
+        self,
+        workspace_id: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch all datasets in a workspace.
+
+        Parameters
+        ----------
+        workspace_id : str
+            Power BI workspace (group) ID.
+
+        Returns
+        -------
+        list[dict]
+            List of dataset dicts from the API response.
+
+        Raises
+        ------
+        requests.HTTPError
+            On non-retryable HTTP errors.
+        """
+        url = f"{BASE_URL}/groups/{workspace_id}/datasets"
+
+        response = self._session.get(
+            url,
+            headers=self._headers,
+            timeout=self._request_timeout,
+        )
+        response.raise_for_status()
+        return response.json().get("value", [])
+
+    def get_datasets_in_workspace_safe(
+        self,
+        workspace_id: str,
+        workspace_name: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch all datasets in a workspace with graceful error handling.
+
+        Logs warnings for expected failure modes (404, 403) and returns
+        an empty list instead of raising.
+
+        Parameters
+        ----------
+        workspace_id : str
+            Power BI workspace (group) ID.
+        workspace_name : str
+            Human-readable name for logging.
+
+        Returns
+        -------
+        list[dict]
+        """
+        try:
+            return self.get_datasets_in_workspace(workspace_id)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 404:
+                logger.warning(
+                    "Workspace '%s' (%s) not found — it may have been deleted. Skipping.",
+                    workspace_name,
+                    workspace_id,
+                )
+                return []
+            if status == 403:
+                logger.error(
+                    "Access denied for workspace '%s' (%s). "
+                    "Ensure the Service Principal has workspace access.",
+                    workspace_name,
                     workspace_id,
                 )
                 return []

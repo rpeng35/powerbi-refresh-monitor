@@ -41,6 +41,45 @@ def extract_error_code(service_exception_json: str | None) -> str | None:
         return "PARSE_ERROR"
 
 
+def filter_records_by_watermark(
+    raw_records: list[dict[str, Any]],
+    watermark: str | None,
+) -> list[dict[str, Any]]:
+    """Filter raw API records to only include those newer than the watermark.
+
+    Parameters
+    ----------
+    raw_records : list[dict]
+        Raw refresh records from the Power BI API.
+    watermark : str | None
+        ISO-8601 timestamp of the latest known record for this dataset.
+        If None, all records pass through (full extraction mode).
+
+    Returns
+    -------
+    list[dict]
+        Records with ``startTime`` > *watermark*, or all records if
+        *watermark* is None.
+    """
+    if not watermark:
+        return raw_records
+
+    wm_dt = dt_parser.isoparse(watermark)
+    filtered = []
+    for record in raw_records:
+        start_time = record.get("startTime")
+        if not start_time:
+            filtered.append(record)
+            continue
+        try:
+            if dt_parser.isoparse(start_time) > wm_dt:
+                filtered.append(record)
+        except (ValueError, TypeError):
+            filtered.append(record)
+
+    return filtered
+
+
 def transform_refresh_records(
     raw_records: list[dict[str, Any]],
     dataset_id: str,

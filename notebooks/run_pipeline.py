@@ -7,6 +7,12 @@
 # MAGIC transforms the data, and upserts into a Delta Lake table. Optionally runs
 # MAGIC post-ingestion alert checks.
 # MAGIC
+# MAGIC **Features:**
+# MAGIC - **Workspace-level auto-discovery** — point at a workspace and all datasets are found.
+# MAGIC - **Incremental extraction** — watermark per dataset, only new records are processed.
+# MAGIC - **Concurrent API calls** — configurable thread pool for faster extraction at scale.
+# MAGIC - **Partial-failure tolerance** — one failing dataset does not block the rest.
+# MAGIC
 # MAGIC **Schedule:** Daily at 02:00 AM PST via Databricks Workflow.
 # MAGIC
 # MAGIC **Prerequisites:**
@@ -24,7 +30,7 @@
 import json
 import logging
 import sys
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,8 +47,14 @@ if REPO_ROOT not in sys.path:
 
 from src.auth import PowerBIAuthenticator
 from src.api_client import PowerBIClient
-from src.transform import transform_refresh_records
-from src.delta_ops import ensure_table_exists, upsert_refresh_data, REFRESH_HISTORY_SCHEMA
+from src.transform import transform_refresh_records, filter_records_by_watermark
+from src.delta_ops import (
+    ensure_table_exists,
+    upsert_refresh_data,
+    get_watermarks,
+    REFRESH_HISTORY_SCHEMA,
+)
+from src.discovery import resolve_dataset_registry
 from src.alerts import AlertDispatcher, check_refresh_failures, check_duration_anomalies, check_stale_data
 
 # COMMAND ----------
@@ -60,12 +72,12 @@ TABLE_NAME = f"{delta_cfg['catalog']}.{delta_cfg['schema']}.{delta_cfg['table_na
 
 api_cfg = pipeline_config["api"]
 alert_cfg = pipeline_config["alerting"]
-
-active_datasets = [d for d in datasets_config["datasets"] if d.get("is_active", True)]
+extraction_cfg = pipeline_config.get("extraction", {})
+incremental_enabled = extraction_cfg.get("incremental", True)
 
 logger.info("Pipeline configuration loaded.")
 logger.info("Target Delta table: %s", TABLE_NAME)
-logger.info("Active datasets to process: %d", len(active_datasets))
+logger.info("Incremental extraction: %s", "enabled" if incremental_enabled else "disabled")
 
 # COMMAND ----------
 
@@ -88,62 +100,134 @@ logger.info("Successfully acquired Power BI access token.")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Extract Refresh Histories
+# MAGIC ## 3. Resolve Dataset Registry (Discovery)
 
 # COMMAND ----------
 
-all_records = []
-
-with PowerBIClient(
+client = PowerBIClient(
     access_token=access_token,
     max_retries=api_cfg["max_retries"],
     backoff_factor=api_cfg["backoff_factor"],
     request_timeout=api_cfg["request_timeout_seconds"],
-) as client:
-    for dataset_entry in active_datasets:
-        ws_id = dataset_entry["workspace_id"]
-        ds_id = dataset_entry["dataset_id"]
-        ds_name = dataset_entry["dataset_name"]
-        ws_name = dataset_entry["workspace_name"]
-        is_critical = dataset_entry.get("is_critical", False)
+)
 
-        logger.info("Fetching refresh history for '%s' (workspace: '%s')...", ds_name, ws_name)
+resolved_datasets = resolve_dataset_registry(
+    client=client,
+    datasets_config=datasets_config,
+    inter_request_delay=api_cfg.get("inter_request_delay_seconds", 0.2),
+)
 
-        raw_records = client.get_refresh_history_safe(
-            workspace_id=ws_id,
-            dataset_id=ds_id,
-            dataset_name=ds_name,
-            top=api_cfg["top_records_per_dataset"],
-        )
-
-        if raw_records:
-            transformed = transform_refresh_records(
-                raw_records=raw_records,
-                dataset_id=ds_id,
-                dataset_name=ds_name,
-                workspace_id=ws_id,
-                workspace_name=ws_name,
-                is_critical=is_critical,
-            )
-            all_records.extend(transformed)
-            logger.info("  -> %d refresh records extracted and transformed.", len(transformed))
-        else:
-            logger.info("  -> No refresh records returned.")
-
-        # Respect API rate limits
-        time.sleep(api_cfg.get("inter_request_delay_seconds", 0.2))
-
-logger.info("Total records extracted across all datasets: %d", len(all_records))
+logger.info("Resolved %d active datasets to process.", len(resolved_datasets))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Load into Delta Table
+# MAGIC ## 4. Load Watermarks for Incremental Extraction
 
 # COMMAND ----------
 
-# Ensure the target table exists
 ensure_table_exists(spark, TABLE_NAME)
+
+if incremental_enabled:
+    watermarks = get_watermarks(spark, TABLE_NAME)
+    logger.info("Loaded watermarks for %d datasets.", len(watermarks))
+else:
+    watermarks = {}
+    logger.info("Full extraction mode — no watermarks applied.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Extract Refresh Histories (Concurrent + Incremental)
+
+# COMMAND ----------
+
+max_workers = api_cfg.get("max_concurrent_requests", 4)
+top_records = api_cfg["top_records_per_dataset"]
+
+stats = {"datasets_processed": 0, "datasets_skipped": 0, "datasets_failed": 0}
+
+
+def extract_dataset(dataset_entry: dict) -> list[dict]:
+    """Extract and transform refresh records for a single dataset."""
+    ws_id = dataset_entry["workspace_id"]
+    ds_id = dataset_entry["dataset_id"]
+    ds_name = dataset_entry["dataset_name"]
+    ws_name = dataset_entry["workspace_name"]
+    is_critical = dataset_entry.get("is_critical", False)
+    wm = watermarks.get(ds_id)
+
+    raw_records = client.get_refresh_history_safe(
+        workspace_id=ws_id,
+        dataset_id=ds_id,
+        dataset_name=ds_name,
+        top=top_records,
+    )
+
+    if not raw_records:
+        return []
+
+    filtered = filter_records_by_watermark(raw_records, wm)
+
+    if not filtered:
+        logger.info("  '%s': all %d records already known (watermark: %s). Skipping.",
+                     ds_name, len(raw_records), wm)
+        return []
+
+    transformed = transform_refresh_records(
+        raw_records=filtered,
+        dataset_id=ds_id,
+        dataset_name=ds_name,
+        workspace_id=ws_id,
+        workspace_name=ws_name,
+        is_critical=is_critical,
+    )
+
+    logger.info("  '%s': %d new of %d fetched (watermark: %s).",
+                 ds_name, len(transformed), len(raw_records), wm or "none")
+    return transformed
+
+
+all_records = []
+
+with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    future_to_entry = {
+        executor.submit(extract_dataset, entry): entry
+        for entry in resolved_datasets
+    }
+
+    for future in as_completed(future_to_entry):
+        entry = future_to_entry[future]
+        try:
+            records = future.result()
+            if records:
+                all_records.extend(records)
+                stats["datasets_processed"] += 1
+            else:
+                stats["datasets_skipped"] += 1
+        except Exception as exc:
+            stats["datasets_failed"] += 1
+            logger.error(
+                "Failed to extract dataset '%s' (%s): %s",
+                entry.get("dataset_name", "?"),
+                entry.get("dataset_id", "?"),
+                exc,
+            )
+
+logger.info(
+    "Extraction complete: %d records from %d datasets (%d skipped, %d failed).",
+    len(all_records),
+    stats["datasets_processed"],
+    stats["datasets_skipped"],
+    stats["datasets_failed"],
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Load into Delta Table
+
+# COMMAND ----------
 
 if all_records:
     # Create a Spark DataFrame from the transformed records
@@ -155,12 +239,12 @@ if all_records:
     upsert_refresh_data(spark, new_data_df, TABLE_NAME)
     logger.info("Delta table '%s' updated successfully.", TABLE_NAME)
 else:
-    logger.warning("No records to load — all API calls returned empty results.")
+    logger.warning("No new records to load — all datasets were up-to-date or returned empty results.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Post-Ingestion Alert Checks
+# MAGIC ## 7. Post-Ingestion Alert Checks
 
 # COMMAND ----------
 
@@ -194,21 +278,27 @@ if alert_cfg.get("enabled", False) and all_records:
 
     logger.info("Alert checks complete. Total alerts fired: %d", len(all_alerts))
 else:
-    logger.info("Alerting is disabled or no records were ingested — skipping alert checks.")
+    logger.info("Alerting is disabled or no new records were ingested — skipping alert checks.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Summary
+# MAGIC ## 8. Cleanup & Summary
 
 # COMMAND ----------
+
+client.close()
 
 print("=" * 60)
 print("  PIPELINE RUN SUMMARY")
 print("=" * 60)
-print(f"  Datasets processed:  {len(active_datasets)}")
+print(f"  Datasets resolved:   {len(resolved_datasets)}")
+print(f"  Datasets processed:  {stats['datasets_processed']}")
+print(f"  Datasets skipped:    {stats['datasets_skipped']} (up-to-date)")
+print(f"  Datasets failed:     {stats['datasets_failed']}")
 print(f"  Records ingested:    {len(all_records)}")
 print(f"  Target table:        {TABLE_NAME}")
+print(f"  Incremental:         {'yes' if incremental_enabled else 'no'}")
 if alert_cfg.get("enabled", False) and all_records:
     print(f"  Alerts fired:        {len(all_alerts)}")
 print("=" * 60)
