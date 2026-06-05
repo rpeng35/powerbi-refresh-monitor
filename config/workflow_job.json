@@ -1,0 +1,49 @@
+{
+  "_comment": "Databricks Workflow job definition. Deploy via the Databricks Jobs API or UI.",
+  "name": "Power BI Refresh History — Daily Ingestion",
+  "tasks": [
+    {
+      "task_key": "run_pipeline",
+      "description": "Extract refresh histories from Power BI API, transform, and upsert into Delta table.",
+      "notebook_task": {
+        "notebook_path": "/Repos/<user>/powerbi-refresh-monitor/notebooks/run_pipeline",
+        "source": "WORKSPACE"
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "Standard_DS3_v2",
+        "num_workers": 0,
+        "spark_conf": {
+          "spark.master": "local[*]",
+          "spark.databricks.cluster.profile": "singleNode"
+        },
+        "custom_tags": {
+          "ResourceClass": "SingleNode"
+        }
+      },
+      "libraries": [
+        {"pypi": {"package": "msal>=1.28.0"}},
+        {"pypi": {"package": "requests>=2.31.0"}},
+        {"pypi": {"package": "python-dateutil>=2.8.0"}}
+      ],
+      "timeout_seconds": 1800,
+      "max_retries": 2,
+      "retry_on_timeout": true
+    }
+  ],
+  "schedule": {
+    "quartz_cron_expression": "0 0 10 * * ?",
+    "timezone_id": "UTC",
+    "_note": "10:00 UTC = 02:00 AM PST. Adjust for daylight saving if needed."
+  },
+  "email_notifications": {
+    "on_failure": ["your-team@example.com"],
+    "no_alert_for_skipped_runs": true
+  },
+  "max_concurrent_runs": 1,
+  "tags": {
+    "project": "powerbi-refresh-monitor",
+    "team": "data-engineering",
+    "environment": "production"
+  }
+}

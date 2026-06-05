@@ -1,0 +1,31 @@
+{
+  "_comment": "Configuration registry for monitored Power BI datasets. Supports both explicit dataset entries and workspace-level auto-discovery. No code changes needed to add/remove items.",
+  "datasets": [
+    {
+      "workspace_id": "YOUR_WORKSPACE_ID_HERE",
+      "workspace_name": "Finance Reports",
+      "dataset_id": "YOUR_DATASET_ID_HERE",
+      "dataset_name": "Monthly Revenue Model",
+      "is_critical": true,
+      "is_active": true
+    },
+    {
+      "workspace_id": "YOUR_WORKSPACE_ID_HERE",
+      "workspace_name": "Marketing Analytics",
+      "dataset_id": "YOUR_DATASET_ID_HERE",
+      "dataset_name": "Campaign Performance",
+      "is_critical": false,
+      "is_active": true
+    }
+  ],
+  "workspaces": [
+    {
+      "_comment": "Auto-discover all datasets in this workspace. Explicit dataset entries above take precedence for is_critical and other flags.",
+      "workspace_id": "YOUR_WORKSPACE_ID_HERE",
+      "workspace_name": "Sales Analytics",
+      "is_critical_default": false,
+      "is_active": false,
+      "exclude_datasets": []
+    }
+  ]
+}
