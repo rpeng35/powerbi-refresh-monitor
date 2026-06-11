@@ -40,6 +40,7 @@ powerbi-refresh-monitor/
 ├── notebooks/
 │   ├── run_pipeline.py        # Refresh-history pipeline notebook (daily execution)
 │   ├── run_query_probe.py     # Response-time probe notebook (daily execution)
+│   ├── run_usage_pipeline.py  # Usage/Activity Events notebook (daily execution)
 │   ├── setup_table.py         # One-time Delta table creation
 │   └── sample_queries.sql     # Analytical SQL queries
 ├── src/
@@ -50,6 +51,7 @@ powerbi-refresh-monitor/
 │   ├── delta_ops.py           # Delta table DDL, upsert, append, and watermark queries
 │   ├── discovery.py           # Workspace-level dataset auto-discovery
 │   ├── query_probe.py         # Active response-time probing (Execute Queries)
+│   ├── usage.py               # Activity Events date-window helpers (incremental)
 │   └── alerts.py              # Post-ingestion alerting framework
 ├── tests/
 │   ├── __init__.py
@@ -57,6 +59,7 @@ powerbi-refresh-monitor/
 │   ├── test_api_client.py
 │   ├── test_discovery.py
 │   ├── test_query_probe.py
+│   ├── test_usage.py
 │   └── test_transform.py
 ├── requirements.txt
 ├── .gitignore
@@ -174,6 +177,35 @@ directly:
 user query, so it is a controlled benchmark rather than full real-user telemetry. It is the
 recommended primary method for response-time trending; Log Analytics remains an optional
 later upgrade if full per-user query telemetry is needed.
+
+## Usage Tracking (Activity Events)
+
+Tracks **report/dashboard usage and popularity** — most-used reports, least-used / unused
+reports, and per-user view counts — from the Power BI **Activity Events** (audit) API.
+
+- `notebooks/run_usage_pipeline.py` pulls activity events one UTC day at a time, normalizes
+  them, and MERGEs into the `powerbi_activity_events` Delta table (keyed on `event_id`, so
+  re-runs never duplicate).
+- **Incremental & retention-aware:** the Activity Events API retains only **~28 days** of
+  history, so the pipeline runs day-by-day over a bounded window and re-fetches only the most
+  recent days (via a `creation_date` watermark). **Run it daily** so every run banks another
+  day into Delta — building the long-term history the API itself won't keep.
+- Optionally filter to specific activities (e.g. `["ViewReport", "ViewDashboard"]`) via
+  `usage.tracked_activities`, or leave it `null` to ingest all event types.
+
+### Setup
+1. Have a Power BI admin enable the **"Allow service principals to use read-only admin APIs"**
+   tenant setting and scope it to the Service Principal's security group (an admin-API
+   permission toggle — **not** a cost). This is separate from the standard "call Fabric public
+   APIs" setting used by the refresh pipeline.
+2. Set `activity_events_table.catalog`/`schema` and the `usage` block in
+   `config/pipeline_config.json`.
+3. Run `notebooks/run_usage_pipeline.py` (it creates the table on first run). Schedule it
+   daily via a Databricks Workflow.
+
+> **Unused-report detection:** combining this usage data with a report inventory (Metadata
+> Scanner) lets you flag reports that *exist but are never viewed*. The inventory scan is a
+> planned future addition.
 
 ## Local Development & Testing
 

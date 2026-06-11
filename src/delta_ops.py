@@ -276,3 +276,159 @@ def append_query_performance_data(
     logger.info("Appending %d probe measurements into '%s'.", row_count, table_name)
     new_data_df.write.format("delta").mode("append").saveAsTable(table_name)
     logger.info("Append complete for '%s'.", table_name)
+
+
+ACTIVITY_EVENTS_SCHEMA = StructType(
+    [
+        StructField("event_id", StringType(), nullable=False),
+        StructField("creation_time", TimestampType(), nullable=True),
+        StructField("creation_date", DateType(), nullable=True),
+        StructField("activity", StringType(), nullable=True),
+        StructField("user_id", StringType(), nullable=True),
+        StructField("user_key", StringType(), nullable=True),
+        StructField("workspace_id", StringType(), nullable=True),
+        StructField("workspace_name", StringType(), nullable=True),
+        StructField("report_id", StringType(), nullable=True),
+        StructField("report_name", StringType(), nullable=True),
+        StructField("report_type", StringType(), nullable=True),
+        StructField("dataset_id", StringType(), nullable=True),
+        StructField("dataset_name", StringType(), nullable=True),
+        StructField("capacity_id", StringType(), nullable=True),
+        StructField("consumption_method", StringType(), nullable=True),
+        StructField("distribution_method", StringType(), nullable=True),
+        StructField("item_name", StringType(), nullable=True),
+        StructField("object_id", StringType(), nullable=True),
+        StructField("result_status", StringType(), nullable=True),
+        StructField("ingestion_timestamp", TimestampType(), nullable=False),
+        StructField("ingestion_date", DateType(), nullable=False),
+    ]
+)
+
+
+def get_activity_events_ddl(table_name: str) -> str:
+    """Return the DDL for the activity-events (usage) Delta table."""
+    return f"""
+    CREATE TABLE IF NOT EXISTS {table_name} (
+        event_id            STRING          NOT NULL
+            COMMENT 'Unique identifier per audit event (from Power BI API)',
+        creation_time       TIMESTAMP
+            COMMENT 'UTC time the activity occurred',
+        creation_date       DATE
+            COMMENT 'Partition column: date the activity occurred (UTC)',
+        activity            STRING
+            COMMENT 'Activity type, e.g. ViewReport | ViewDashboard | CreateReport',
+        user_id             STRING
+            COMMENT 'UPN / email of the user who performed the activity',
+        user_key            STRING
+            COMMENT 'Stable internal key for the user',
+        workspace_id        STRING
+            COMMENT 'Power BI workspace (group) ID, when applicable',
+        workspace_name      STRING
+            COMMENT 'Workspace name, when applicable',
+        report_id           STRING
+            COMMENT 'Report ID, when the activity targets a report',
+        report_name         STRING
+            COMMENT 'Report name, when applicable',
+        report_type         STRING
+            COMMENT 'Report type, e.g. PowerBIReport | PaginatedReport',
+        dataset_id          STRING
+            COMMENT 'Dataset (semantic model) ID, when applicable',
+        dataset_name        STRING
+            COMMENT 'Dataset name, when applicable',
+        capacity_id         STRING
+            COMMENT 'Capacity ID hosting the item, when applicable',
+        consumption_method  STRING
+            COMMENT 'How the content was consumed, when reported',
+        distribution_method STRING
+            COMMENT 'How the content was distributed, when reported',
+        item_name           STRING
+            COMMENT 'Name of the affected item, when reported',
+        object_id           STRING
+            COMMENT 'Object ID of the affected item, when reported',
+        result_status       STRING
+            COMMENT 'Succeeded | Failed for the activity, when reported',
+        ingestion_timestamp TIMESTAMP       NOT NULL
+            COMMENT 'UTC timestamp when this record was ingested by the pipeline',
+        ingestion_date      DATE            NOT NULL
+            COMMENT 'Date this record was ingested'
+    )
+    USING DELTA
+    PARTITIONED BY (creation_date)
+    COMMENT 'Power BI activity (audit) events for usage/popularity analysis, ingested daily.'
+    TBLPROPERTIES (
+        'delta.autoOptimize.optimizeWrite' = 'true',
+        'delta.autoOptimize.autoCompact'   = 'true'
+    )
+    """
+
+
+def ensure_activity_events_table_exists(spark: SparkSession, table_name: str) -> None:
+    """Create the activity-events Delta table if it does not already exist."""
+    logger.info("Ensuring activity-events table '%s' exists.", table_name)
+    spark.sql(get_activity_events_ddl(table_name))
+    logger.info("Activity-events table '%s' is ready.", table_name)
+
+
+def get_max_activity_date(spark: SparkSession, table_name: str):
+    """Return the latest ``creation_date`` already stored, or None.
+
+    Used to drive incremental day-by-day extraction so we re-fetch only the
+    most recent (possibly incomplete) days rather than the full window.
+
+    Returns
+    -------
+    datetime.date | None
+        The max stored activity date, or None if the table is absent/empty.
+    """
+    try:
+        if not spark.catalog.tableExists(table_name):
+            return None
+        row = spark.sql(
+            f"SELECT MAX(creation_date) AS max_date FROM {table_name}"
+        ).collect()[0]
+        return row["max_date"]
+    except Exception as exc:
+        logger.warning(
+            "Could not read activity watermark from '%s': %s. Using full window.",
+            table_name,
+            exc,
+        )
+        return None
+
+
+def upsert_activity_events(
+    spark: SparkSession,
+    new_data_df: DataFrame,
+    table_name: str,
+) -> None:
+    """Merge new activity events into the Delta table, keyed on ``event_id``.
+
+    Audit events are immutable, so matched rows are left untouched and only
+    new ``event_id`` values are inserted. This makes re-running a day (e.g.
+    overlapping windows) idempotent — no duplicates.
+
+    Parameters
+    ----------
+    spark : SparkSession
+    new_data_df : DataFrame
+        Transformed activity-event records to merge.
+    table_name : str
+        Fully qualified Delta table name.
+    """
+    from delta.tables import DeltaTable
+
+    if new_data_df.isEmpty():
+        logger.info("No new activity events to merge.")
+        return
+
+    deduped_df = new_data_df.dropDuplicates(["event_id"])
+    row_count = deduped_df.count()
+    logger.info("Merging %d activity events into '%s'.", row_count, table_name)
+
+    delta_table = DeltaTable.forName(spark, table_name)
+    delta_table.alias("target").merge(
+        deduped_df.alias("source"),
+        "target.event_id = source.event_id",
+    ).whenNotMatchedInsertAll().execute()
+
+    logger.info("Activity-events merge complete for '%s'.", table_name)

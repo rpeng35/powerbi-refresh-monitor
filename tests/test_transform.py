@@ -9,6 +9,7 @@ from src.transform import (
     compute_duration_seconds,
     extract_error_code,
     filter_records_by_watermark,
+    transform_activity_events,
     transform_refresh_records,
 )
 
@@ -255,3 +256,63 @@ class TestFilterRecordsByWatermark:
         ]
         result = filter_records_by_watermark(records, "2024-06-01T00:00:00Z")
         assert len(result) == 2
+
+
+class TestTransformActivityEvents:
+    SAMPLE = [
+        {
+            "Id": "evt-1",
+            "CreationTime": "2024-06-01T13:45:00Z",
+            "Activity": "ViewReport",
+            "UserId": "alice@contoso.com",
+            "WorkspaceId": "ws-1",
+            "WorkSpaceName": "Finance Reports",
+            "ReportId": "rpt-1",
+            "ReportName": "Monthly Revenue",
+            "DatasetId": "ds-1",
+            "ResultStatus": "Succeeded",
+        },
+        {
+            "Id": "evt-2",
+            "CreationTime": "2024-06-01T14:00:00Z",
+            "Activity": "CreateReport",
+            "UserId": "bob@contoso.com",
+        },
+    ]
+
+    def test_maps_core_fields(self):
+        rows = transform_activity_events(self.SAMPLE)
+        assert len(rows) == 2
+        first = rows[0]
+        assert first["event_id"] == "evt-1"
+        assert first["activity"] == "ViewReport"
+        assert first["user_id"] == "alice@contoso.com"
+        assert first["report_name"] == "Monthly Revenue"
+        assert first["creation_date"] == "2024-06-01"
+        # Tolerates the WorkSpaceName casing variant.
+        assert first["workspace_name"] == "Finance Reports"
+        assert first["workspace_id"] == "ws-1"
+
+    def test_filters_by_tracked_activities(self):
+        rows = transform_activity_events(self.SAMPLE, tracked_activities=["ViewReport"])
+        assert len(rows) == 1
+        assert rows[0]["event_id"] == "evt-1"
+
+    def test_tracked_activities_case_insensitive(self):
+        rows = transform_activity_events(self.SAMPLE, tracked_activities=["viewreport"])
+        assert len(rows) == 1
+
+    def test_skips_events_without_id(self):
+        rows = transform_activity_events([{"Activity": "ViewReport"}])
+        assert rows == []
+
+    def test_unparseable_creation_time_yields_null_date(self):
+        rows = transform_activity_events(
+            [{"Id": "x", "CreationTime": "not-a-date", "Activity": "ViewReport"}]
+        )
+        assert rows[0]["creation_date"] is None
+
+    def test_missing_optional_fields_are_none(self):
+        rows = transform_activity_events(self.SAMPLE)
+        assert rows[1]["report_name"] is None
+        assert rows[1]["workspace_id"] is None

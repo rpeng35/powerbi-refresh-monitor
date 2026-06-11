@@ -235,3 +235,93 @@ class TestExecuteDaxQuery:
             client._session = mock_session
             with pytest.raises(requests.HTTPError):
                 client.execute_dax_query("ws-1", "ds-1", "EVALUATE ROW(\"x\", 1)")
+
+
+class TestGetActivityEvents:
+    @patch("src.api_client.requests.Session")
+    def test_single_page(self, mock_session_cls):
+        mock_session = MagicMock()
+        page = MagicMock()
+        page.json.return_value = {
+            "activityEventEntities": [{"Id": "e1"}, {"Id": "e2"}],
+            "continuationToken": None,
+            "continuationUri": None,
+        }
+        page.raise_for_status.return_value = None
+        mock_session.get.return_value = page
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            events = client.get_activity_events(
+                "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+            )
+
+        assert [e["Id"] for e in events] == ["e1", "e2"]
+        assert mock_session.get.call_count == 1
+        # Verify the date params are single-quoted per the API contract.
+        _, kwargs = mock_session.get.call_args
+        assert kwargs["params"]["startDateTime"] == "'2024-06-01T00:00:00'"
+
+    @patch("src.api_client.requests.Session")
+    def test_follows_continuation_token(self, mock_session_cls):
+        mock_session = MagicMock()
+
+        page1 = MagicMock()
+        page1.json.return_value = {
+            "activityEventEntities": [{"Id": "e1"}],
+            "continuationToken": "tok",
+            "continuationUri": "https://api.powerbi.com/next",
+        }
+        page1.raise_for_status.return_value = None
+
+        page2 = MagicMock()
+        page2.json.return_value = {
+            "activityEventEntities": [{"Id": "e2"}],
+            "continuationToken": None,
+            "continuationUri": None,
+        }
+        page2.raise_for_status.return_value = None
+
+        mock_session.get.side_effect = [page1, page2]
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            events = client.get_activity_events(
+                "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+            )
+
+        assert [e["Id"] for e in events] == ["e1", "e2"]
+        assert mock_session.get.call_count == 2
+
+    @patch("src.api_client.requests.Session")
+    def test_safe_returns_empty_on_403(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_session.get.side_effect = requests.HTTPError(response=mock_response)
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            events = client.get_activity_events_safe(
+                "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+            )
+
+        assert events == []
+
+    @patch("src.api_client.requests.Session")
+    def test_safe_raises_on_unexpected_error(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_session.get.side_effect = requests.HTTPError(response=mock_response)
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(requests.HTTPError):
+                client.get_activity_events_safe(
+                    "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+                )

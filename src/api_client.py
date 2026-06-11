@@ -279,6 +279,94 @@ class PowerBIClient:
         payload = response.json()
         return {"duration_ms": duration_ms, "row_count": _count_rows(payload)}
 
+    def get_activity_events(
+        self,
+        start_datetime: str,
+        end_datetime: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch Power BI activity (audit) events for a single UTC day.
+
+        Calls the admin ``activityevents`` API and follows continuation tokens
+        until the full result set for the window has been retrieved.
+
+        Parameters
+        ----------
+        start_datetime, end_datetime : str
+            ISO-8601 UTC timestamps **without** offset (e.g.
+            ``2024-06-01T00:00:00`` / ``2024-06-01T23:59:59``). The API requires
+            both to fall within the same UTC day.
+
+        Returns
+        -------
+        list[dict]
+            All activity event entities in the window.
+
+        Raises
+        ------
+        requests.HTTPError
+            On non-retryable HTTP errors (401/403 when the read-only admin API
+            tenant setting is not enabled for the service principal).
+        """
+        url = f"{BASE_URL}/admin/activityevents"
+        params = {
+            "startDateTime": f"'{start_datetime}'",
+            "endDateTime": f"'{end_datetime}'",
+        }
+
+        response = self._session.get(
+            url,
+            headers=self._headers,
+            params=params,
+            timeout=self._request_timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        events: list[dict[str, Any]] = list(payload.get("activityEventEntities", []))
+        continuation_token = payload.get("continuationToken")
+        continuation_uri = payload.get("continuationUri")
+
+        while continuation_token and continuation_uri:
+            response = self._session.get(
+                continuation_uri,
+                headers=self._headers,
+                timeout=self._request_timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            events.extend(payload.get("activityEventEntities", []))
+            continuation_token = payload.get("continuationToken")
+            continuation_uri = payload.get("continuationUri")
+
+        return events
+
+    def get_activity_events_safe(
+        self,
+        start_datetime: str,
+        end_datetime: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch activity events with graceful error handling.
+
+        Logs a clear message for the common 401/403 case — the
+        "Allow service principals to use read-only admin APIs" tenant setting
+        not yet enabled/scoped — and returns an empty list instead of raising.
+        Unexpected errors are re-raised.
+        """
+        try:
+            return self.get_activity_events(start_datetime, end_datetime)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (401, 403):
+                logger.error(
+                    "Access denied (HTTP %s) calling activityevents for %s. Ensure the "
+                    "'Allow service principals to use read-only admin APIs' tenant setting "
+                    "is enabled and scoped to the service principal's security group.",
+                    status,
+                    start_datetime,
+                )
+                return []
+            raise
+
     def close(self) -> None:
         self._session.close()
 
