@@ -5,7 +5,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from src.api_client import PowerBIClient, _count_rows
+from src.api_client import (
+    PowerBIClient,
+    RateLimitError,
+    _count_rows,
+    _parse_retry_after,
+    _rate_limit_headers,
+)
 
 
 class TestPowerBIClient:
@@ -325,3 +331,91 @@ class TestGetActivityEvents:
                 client.get_activity_events_safe(
                     "2024-06-01T00:00:00", "2024-06-01T23:59:59"
                 )
+
+
+class TestRateLimitHelpers:
+    def test_extracts_only_rate_limit_headers(self):
+        headers = {
+            "Content-Type": "application/json",
+            "Retry-After": "60",
+            "RateLimit-Remaining": "0",
+            "x-ms-throttle-scope": "tenant",
+            "X-RateLimit-Limit": "200",
+        }
+        found = _rate_limit_headers(headers)
+        assert found == {
+            "Retry-After": "60",
+            "RateLimit-Remaining": "0",
+            "x-ms-throttle-scope": "tenant",
+            "X-RateLimit-Limit": "200",
+        }
+
+    def test_parse_retry_after_seconds(self):
+        assert _parse_retry_after({"Retry-After": "120"}) == 120
+
+    def test_parse_retry_after_missing_or_non_numeric(self):
+        assert _parse_retry_after({}) is None
+        # HTTP-date form is not delta-seconds; we only parse integer seconds.
+        assert _parse_retry_after({"Retry-After": "Wed, 21 Oct 2025 07:28:00 GMT"}) is None
+
+
+class TestActivityEventsThrottling:
+    def _throttled_response(self, retry_after="300"):
+        resp = MagicMock()
+        resp.status_code = 429
+        resp.headers = {"Retry-After": retry_after, "x-ms-throttle-scope": "tenant"}
+        return resp
+
+    @patch("src.api_client.requests.Session")
+    def test_429_raises_rate_limit_error(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_session.get.return_value = self._throttled_response("300")
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(RateLimitError) as exc_info:
+                client.get_activity_events(
+                    "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+                )
+
+        assert exc_info.value.retry_after == 300
+
+    @patch("src.api_client.requests.Session")
+    def test_safe_does_not_swallow_rate_limit(self, mock_session_cls):
+        # Throttling must propagate (not return []) so the caller stops and the
+        # watermark is preserved - no silent data gaps.
+        mock_session = MagicMock()
+        mock_session.get.return_value = self._throttled_response("60")
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(RateLimitError):
+                client.get_activity_events_safe(
+                    "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+                )
+
+    @patch("src.api_client.requests.Session")
+    def test_429_on_continuation_page_raises(self, mock_session_cls):
+        mock_session = MagicMock()
+        page1 = MagicMock()
+        page1.status_code = 200
+        page1.json.return_value = {
+            "activityEventEntities": [{"Id": "e1"}],
+            "continuationToken": "tok",
+            "continuationUri": "https://api.powerbi.com/next",
+        }
+        page1.raise_for_status.return_value = None
+        mock_session.get.side_effect = [page1, self._throttled_response("30")]
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(RateLimitError) as exc_info:
+                client.get_activity_events(
+                    "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+                )
+
+        assert exc_info.value.retry_after == 30
+        assert mock_session.get.call_count == 2

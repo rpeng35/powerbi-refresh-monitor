@@ -44,9 +44,9 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.auth import PowerBIAuthenticator
-from src.api_client import PowerBIClient
+from src.api_client import PowerBIClient, RateLimitError
 from src.transform import transform_activity_events
-from src.usage import get_dates_to_fetch, day_bounds
+from src.usage import get_dates_to_fetch, day_bounds, limit_backfill
 from src.delta_ops import (
     ensure_activity_events_table_exists,
     get_max_activity_date,
@@ -67,6 +67,9 @@ usage_cfg = pipeline_config.get("usage", {})
 lookback_days = usage_cfg.get("lookback_days", 28)
 tracked_activities = usage_cfg.get("tracked_activities")  # None = all activities
 incremental = usage_cfg.get("incremental", True)
+# Cap days fetched per run so the initial backfill stays under the admin
+# API's tight tenant-wide quota; None/0 = no cap (fetch the whole window).
+max_days_per_run = usage_cfg.get("max_backfill_days_per_run")
 
 logger.info("Configuration loaded. Target table: %s", TABLE_NAME)
 logger.info("Lookback days: %d | tracked activities: %s", lookback_days, tracked_activities or "ALL")
@@ -99,6 +102,7 @@ ensure_activity_events_table_exists(spark, TABLE_NAME)
 
 last_loaded_date = get_max_activity_date(spark, TABLE_NAME) if incremental else None
 dates_to_fetch = get_dates_to_fetch(lookback_days, last_loaded_date=last_loaded_date)
+dates_to_fetch = limit_backfill(dates_to_fetch, max_days_per_run)
 
 logger.info(
     "Last loaded activity date: %s. Days to fetch: %d (%s ... %s).",
@@ -107,6 +111,12 @@ logger.info(
     dates_to_fetch[0] if dates_to_fetch else "-",
     dates_to_fetch[-1] if dates_to_fetch else "-",
 )
+if max_days_per_run and len(dates_to_fetch) == max_days_per_run:
+    logger.info(
+        "Backfill capped at %d day(s) this run; re-run (or wait for the next "
+        "scheduled run) to continue catching up.",
+        max_days_per_run,
+    )
 
 # COMMAND ----------
 
@@ -116,6 +126,7 @@ logger.info(
 # COMMAND ----------
 
 all_rows = []
+throttled = False
 
 with PowerBIClient(
     access_token=access_token,
@@ -127,7 +138,22 @@ with PowerBIClient(
         start_dt, end_dt = day_bounds(day)
         logger.info("Fetching activity events for %s ...", day)
 
-        raw_events = client.get_activity_events_safe(start_dt, end_dt)
+        try:
+            raw_events = client.get_activity_events_safe(start_dt, end_dt)
+        except RateLimitError as exc:
+            # Days are fetched oldest-first, so everything already collected is
+            # older than this day. Stop, merge what we have, and let the next run
+            # resume from the watermark - no silent gaps.
+            logger.warning(
+                "Throttled on %s (%s). Stopping after %d earlier day(s); "
+                "the next run resumes from the watermark.",
+                day,
+                exc,
+                dates_to_fetch.index(day),
+            )
+            throttled = True
+            break
+
         rows = transform_activity_events(raw_events, tracked_activities=tracked_activities)
         all_rows.extend(rows)
         logger.info("  -> %d raw events, %d rows kept.", len(raw_events), len(rows))
@@ -135,7 +161,7 @@ with PowerBIClient(
         # Respect API rate limits between days.
         time.sleep(api_cfg.get("inter_request_delay_seconds", 0.2))
 
-logger.info("Total activity rows extracted: %d", len(all_rows))
+logger.info("Total activity rows extracted: %d (throttled=%s)", len(all_rows), throttled)
 
 # COMMAND ----------
 
@@ -161,10 +187,14 @@ else:
 print("=" * 60)
 print("  USAGE PIPELINE RUN SUMMARY")
 print("=" * 60)
-print(f"  Days fetched:     {len(dates_to_fetch)}")
+print(f"  Days planned:     {len(dates_to_fetch)}")
 print(f"  Rows ingested:    {len(all_rows)}")
+print(f"  Throttled:        {throttled}")
 print(f"  Target table:     {TABLE_NAME}")
 print("=" * 60)
+if throttled:
+    print("  NOTE: run stopped early due to API throttling (HTTP 429).")
+    print("        Re-run later to continue; the watermark prevents data loss.")
 
 if all_rows:
     print("\nTop 10 most-viewed reports (last 30 days):")

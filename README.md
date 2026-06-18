@@ -60,7 +60,8 @@ powerbi-refresh-monitor/
 │   ├── test_discovery.py
 │   ├── test_query_probe.py
 │   ├── test_usage.py
-│   └── test_transform.py
+│   ├── test_transform.py
+│   └── rate_limit_probe.py    # Standalone live rate-limit / throttling diagnostic
 ├── requirements.txt
 ├── .gitignore
 └── README.md
@@ -206,6 +207,23 @@ reports, and per-user view counts — from the Power BI **Activity Events** (aud
 > **Unused-report detection:** combining this usage data with a report inventory (Metadata
 > Scanner) lets you flag reports that *exist but are never viewed*. The inventory scan is a
 > planned future addition.
+
+## API Rate Limits & Throttling
+
+The endpoints this project uses are governed by **different** quotas:
+
+| Endpoint | Used by | Limit type |
+|---|---|---|
+| `GET /groups`, `GET .../refreshes` | discovery, refresh history | General per-principal API throttle (~200 req/hr); 1 cheap call per dataset |
+| `POST .../executeQueries` | response-time probe | Per-principal; not auto-retried (a retry would inflate the timing) |
+| `GET /admin/activityevents` | usage tracking | **Admin API: tight ~200 req/hr quota, shared tenant-wide**, and multiplied by continuation-token pagination |
+
+**How throttling is handled:**
+- All GETs share a session that auto-retries on `429/5xx` and **honors the `Retry-After` header** (`api.max_retries`, `api.backoff_factor`).
+- A 429 that survives retries is logged with all rate-limit headers and raised as `RateLimitError` (not swallowed). Because activity events are fetched **oldest-first**, the usage pipeline stops on the throttled day and merges everything older — the `creation_date` watermark is preserved and the next run resumes from there, so **no days are silently skipped**.
+- `usage.max_backfill_days_per_run` caps how many days the initial ~28-day backfill loads per run, keeping it under the admin quota; re-run (or let the daily schedule run) until caught up.
+
+**Measuring the real limits:** `tests/rate_limit_probe.py` is a standalone diagnostic that bursts each endpoint with the Service Principal credentials and reports where the first `429` appears, the exact `Retry-After`, and all rate-limit headers — writing a JSON report. It is **opt-in for the admin endpoint** (`--include-admin`) and capped (`--max-requests`) so discovering the limit doesn't itself exhaust the tenant-wide admin quota. See the file header for usage.
 
 ## Local Development & Testing
 

@@ -61,6 +61,33 @@ def get_dates_to_fetch(
     return days
 
 
+def limit_backfill(dates: list[date], max_days_per_run: int | None) -> list[date]:
+    """Cap a fetch window to the oldest ``max_days_per_run`` dates.
+
+    The Activity Events admin API has a tight, tenant-wide quota (~200
+    requests/hour), and one busy day can require several continuation-token
+    calls. Loading all ~28 days at once on the first run risks throttling, so
+    the initial backfill is split across runs: each run takes the **oldest**
+    chunk, the watermark advances, and subsequent runs pick up where it left
+    off until caught up.
+
+    Parameters
+    ----------
+    dates : list[datetime.date]
+        Ascending dates from :func:`get_dates_to_fetch`.
+    max_days_per_run : int | None
+        Maximum days to fetch in one run. ``None`` or <= 0 means no cap.
+
+    Returns
+    -------
+    list[datetime.date]
+        The (possibly truncated) oldest-first list of dates to fetch now.
+    """
+    if not max_days_per_run or max_days_per_run <= 0:
+        return dates
+    return dates[:max_days_per_run]
+
+
 def day_bounds(day: date) -> tuple[str, str]:
     """Return ``(start, end)`` ISO-8601 UTC strings spanning the full ``day``.
 
