@@ -12,6 +12,21 @@
     "table_name": "powerbi_query_performance",
     "_full_name_note": "Resolved as: {catalog}.{schema}.{table_name}. Written by notebooks/run_query_probe.py."
   },
+  "activity_events_table": {
+    "catalog": "your_catalog",
+    "schema": "your_schema",
+    "table_name": "powerbi_activity_events",
+    "_full_name_note": "Resolved as: {catalog}.{schema}.{table_name}. Written by notebooks/run_usage_pipeline.py."
+  },
+  "usage": {
+    "lookback_days": 28,
+    "tracked_activities": null,
+    "incremental": true,
+    "max_backfill_days_per_run": 7,
+    "_tracked_activities_note": "null = ingest ALL activity types. To track only consumption, set e.g. [\"ViewReport\", \"ViewDashboard\"]. Activity Events retains only ~28 days, so run daily to build long-term history.",
+    "_max_backfill_days_per_run_note": "Caps days fetched per run so the initial ~28-day backfill stays under the admin API's tight tenant-wide quota (~200 req/hr). Each run loads the oldest uncaught days and advances the watermark; re-run until caught up. Set null/0 to disable the cap.",
+    "_access_note": "Requires the 'Allow service principals to use read-only admin APIs' tenant setting, enabled and scoped to the service principal's security group."
+  },
   "api": {
     "top_records_per_dataset": 60,
     "request_timeout_seconds": 30,

@@ -20,6 +20,66 @@ BASE_URL = "https://api.powerbi.com/v1.0/myorg"
 # HTTP status codes that warrant automatic retry
 RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504]
 
+# Response headers that carry throttling / quota info across the various
+# Microsoft and RFC conventions. Matched case-insensitively when logging.
+_RATE_LIMIT_HEADER_PREFIXES = ("ratelimit-", "x-ratelimit-", "x-ms-")
+_RATE_LIMIT_HEADER_EXACT = ("retry-after",)
+
+
+class RateLimitError(Exception):
+    """Raised when an endpoint is throttled (HTTP 429) after retries are exhausted.
+
+    Carries ``retry_after`` (seconds, if the API supplied it) so callers can
+    decide to back off and resume later rather than silently skipping data.
+    """
+
+    def __init__(self, message: str, retry_after: int | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _rate_limit_headers(headers: Any) -> dict[str, str]:
+    """Return only the throttling-relevant response headers (for diagnostics)."""
+    found: dict[str, str] = {}
+    for name, value in headers.items():
+        low = name.lower()
+        if low in _RATE_LIMIT_HEADER_EXACT or low.startswith(_RATE_LIMIT_HEADER_PREFIXES):
+            found[name] = value
+    return found
+
+
+def _parse_retry_after(headers: Any) -> int | None:
+    """Parse the ``Retry-After`` header (delta-seconds form) into an int."""
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _raise_if_throttled(response: requests.Response, context: str) -> None:
+    """Convert a 429 response into a :class:`RateLimitError`, logging the headers.
+
+    Called after the session's automatic retries have already been exhausted, so
+    reaching here means the endpoint is still throttled and the caller should
+    stop rather than lose data.
+    """
+    if response.status_code != 429:
+        return
+    retry_after = _parse_retry_after(response.headers)
+    logger.error(
+        "Throttled (HTTP 429) on %s after retries. Retry-After=%ss. Rate-limit headers: %s",
+        context,
+        retry_after,
+        _rate_limit_headers(response.headers),
+    )
+    raise RateLimitError(
+        f"Rate limited (429) on {context}; Retry-After={retry_after}s",
+        retry_after=retry_after,
+    )
+
 
 def _count_rows(payload: dict[str, Any]) -> int:
     """Count rows returned by an Execute Queries response (0 if none/malformed)."""
@@ -278,6 +338,102 @@ class PowerBIClient:
 
         payload = response.json()
         return {"duration_ms": duration_ms, "row_count": _count_rows(payload)}
+
+    def get_activity_events(
+        self,
+        start_datetime: str,
+        end_datetime: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch Power BI activity (audit) events for a single UTC day.
+
+        Calls the admin ``activityevents`` API and follows continuation tokens
+        until the full result set for the window has been retrieved.
+
+        Parameters
+        ----------
+        start_datetime, end_datetime : str
+            ISO-8601 UTC timestamps **without** offset (e.g.
+            ``2024-06-01T00:00:00`` / ``2024-06-01T23:59:59``). The API requires
+            both to fall within the same UTC day.
+
+        Returns
+        -------
+        list[dict]
+            All activity event entities in the window.
+
+        Raises
+        ------
+        requests.HTTPError
+            On non-retryable HTTP errors (401/403 when the read-only admin API
+            tenant setting is not enabled for the service principal).
+        """
+        url = f"{BASE_URL}/admin/activityevents"
+        params = {
+            "startDateTime": f"'{start_datetime}'",
+            "endDateTime": f"'{end_datetime}'",
+        }
+
+        response = self._session.get(
+            url,
+            headers=self._headers,
+            params=params,
+            timeout=self._request_timeout,
+        )
+        _raise_if_throttled(response, f"activityevents [{start_datetime}]")
+        response.raise_for_status()
+        payload = response.json()
+
+        events: list[dict[str, Any]] = list(payload.get("activityEventEntities", []))
+        continuation_token = payload.get("continuationToken")
+        continuation_uri = payload.get("continuationUri")
+
+        while continuation_token and continuation_uri:
+            response = self._session.get(
+                continuation_uri,
+                headers=self._headers,
+                timeout=self._request_timeout,
+            )
+            _raise_if_throttled(response, f"activityevents continuation [{start_datetime}]")
+            response.raise_for_status()
+            payload = response.json()
+            events.extend(payload.get("activityEventEntities", []))
+            continuation_token = payload.get("continuationToken")
+            continuation_uri = payload.get("continuationUri")
+
+        return events
+
+    def get_activity_events_safe(
+        self,
+        start_datetime: str,
+        end_datetime: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch activity events with graceful error handling.
+
+        Logs a clear message for the common 401/403 case — the
+        "Allow service principals to use read-only admin APIs" tenant setting
+        not yet enabled/scoped — and returns an empty list instead of raising.
+
+        Throttling (HTTP 429 / :class:`RateLimitError`) is **deliberately not
+        swallowed**: it is re-raised so the caller stops on the throttled day
+        rather than silently returning ``[]``. Because the pipeline fetches days
+        oldest-first, stopping keeps the watermark at the last fully-loaded day
+        and the throttled day is retried on the next run — no silent gaps.
+        Other unexpected errors are re-raised.
+        """
+        try:
+            return self.get_activity_events(start_datetime, end_datetime)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in (401, 403):
+                logger.error(
+                    "Access denied (HTTP %s) calling activityevents for %s. Ensure the "
+                    "'Allow service principals to use read-only admin APIs' tenant setting "
+                    "is enabled and scoped to the service principal's security group.",
+                    status,
+                    start_datetime,
+                )
+                return []
+            raise
 
     def close(self) -> None:
         self._session.close()
