@@ -136,3 +136,59 @@ WHERE a.status = 'Completed'
   AND b.status = 'Completed'
   AND a.start_time >= current_date() - INTERVAL 1 DAY
 ORDER BY a.start_time;
+
+
+-- =============================================================================
+-- Usage / Popularity Queries (powerbi_activity_events)
+-- =============================================================================
+-- Replace 'your_catalog.your_schema.powerbi_activity_events' with your table name.
+-- =============================================================================
+
+-- 9. Most-viewed reports (last 30 days)
+SELECT
+    report_name,
+    workspace_name,
+    COUNT(*)                 AS views,
+    COUNT(DISTINCT user_id)  AS distinct_users
+FROM your_catalog.your_schema.powerbi_activity_events
+WHERE activity = 'ViewReport'
+  AND creation_date >= current_date() - INTERVAL 30 DAY
+  AND report_name IS NOT NULL
+GROUP BY report_name, workspace_name
+ORDER BY views DESC;
+
+-- 10. Least-used reports that WERE viewed at least once (cleanup candidates)
+SELECT
+    report_name,
+    workspace_name,
+    COUNT(*)        AS views,
+    MAX(creation_date) AS last_viewed
+FROM your_catalog.your_schema.powerbi_activity_events
+WHERE activity = 'ViewReport'
+  AND creation_date >= current_date() - INTERVAL 30 DAY
+  AND report_name IS NOT NULL
+GROUP BY report_name, workspace_name
+ORDER BY views ASC
+LIMIT 25;
+
+-- 11. Daily view trend (overlay against response-time to study traffic-vs-latency)
+SELECT
+    creation_date,
+    COUNT(*)                 AS views,
+    COUNT(DISTINCT user_id)  AS distinct_users
+FROM your_catalog.your_schema.powerbi_activity_events
+WHERE activity = 'ViewReport'
+GROUP BY creation_date
+ORDER BY creation_date;
+
+-- 12. Top users by activity (last 30 days)
+SELECT
+    user_id,
+    COUNT(*) AS total_activities,
+    COUNT(DISTINCT report_id) AS distinct_reports
+FROM your_catalog.your_schema.powerbi_activity_events
+WHERE creation_date >= current_date() - INTERVAL 30 DAY
+  AND user_id IS NOT NULL
+GROUP BY user_id
+ORDER BY total_activities DESC
+LIMIT 25;

@@ -141,3 +141,91 @@ def transform_refresh_records(
         )
 
     return rows
+
+
+def _first(record: dict[str, Any], *keys: str) -> Any:
+    """Return the first present, non-None value among ``keys``.
+
+    Power BI audit events are inconsistent about casing for a few fields
+    (e.g. ``WorkspaceName`` vs ``WorkSpaceName``), so we tolerate both.
+    """
+    for key in keys:
+        value = record.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _activity_date(creation_time: str | None) -> str | None:
+    """Derive a ``YYYY-MM-DD`` partition date from an event's CreationTime."""
+    if not creation_time:
+        return None
+    try:
+        return dt_parser.isoparse(creation_time).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        logger.warning("Failed to parse activity CreationTime: %s", creation_time)
+        return None
+
+
+def transform_activity_events(
+    raw_events: list[dict[str, Any]],
+    tracked_activities: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize raw Power BI activity (audit) events into structured rows.
+
+    Parameters
+    ----------
+    raw_events : list[dict]
+        Raw event entities from the admin ``activityevents`` API.
+    tracked_activities : list[str] | None
+        If provided, only events whose ``Activity`` is in this list are kept
+        (case-insensitive), e.g. ``["ViewReport", "ViewDashboard"]``.
+        ``None`` keeps all event types.
+
+    Returns
+    -------
+    list[dict]
+        Transformed rows ready for Delta Lake ingestion.
+    """
+    ingestion_ts = datetime.now(timezone.utc)
+    tracked = {a.lower() for a in tracked_activities} if tracked_activities else None
+    rows: list[dict[str, Any]] = []
+
+    for event in raw_events:
+        event_id = event.get("Id")
+        if not event_id:
+            logger.warning("Skipping activity event with missing Id.")
+            continue
+
+        activity = event.get("Activity")
+        if tracked is not None and (activity or "").lower() not in tracked:
+            continue
+
+        creation_time = event.get("CreationTime")
+        rows.append(
+            {
+                "event_id": event_id,
+                "creation_time": creation_time,
+                "creation_date": _activity_date(creation_time),
+                "activity": activity,
+                "user_id": event.get("UserId"),
+                "user_key": event.get("UserKey"),
+                "workspace_id": _first(event, "WorkspaceId", "WorkSpaceId"),
+                "workspace_name": _first(event, "WorkspaceName", "WorkSpaceName"),
+                "report_id": event.get("ReportId"),
+                "report_name": event.get("ReportName"),
+                "report_type": event.get("ReportType"),
+                "dataset_id": event.get("DatasetId"),
+                "dataset_name": event.get("DatasetName"),
+                "capacity_id": event.get("CapacityId"),
+                "consumption_method": event.get("ConsumptionMethod"),
+                "distribution_method": event.get("DistributionMethod"),
+                "item_name": event.get("ItemName"),
+                "object_id": event.get("ObjectId"),
+                "result_status": event.get("ResultStatus"),
+                "ingestion_timestamp": ingestion_ts.isoformat(),
+                "ingestion_date": ingestion_ts.strftime("%Y-%m-%d"),
+            }
+        )
+
+    return rows

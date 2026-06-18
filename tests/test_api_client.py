@@ -5,7 +5,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from src.api_client import PowerBIClient
+from src.api_client import (
+    PowerBIClient,
+    RateLimitError,
+    _count_rows,
+    _parse_retry_after,
+    _rate_limit_headers,
+)
 
 
 class TestPowerBIClient:
@@ -181,3 +187,235 @@ class TestWorkspaceDiscovery:
             client._session = mock_session
             with pytest.raises(requests.HTTPError):
                 client.get_datasets_in_workspace_safe("ws-1", "Test WS")
+
+
+class TestCountRows:
+    def test_counts_rows(self):
+        payload = {"results": [{"tables": [{"rows": [{"a": 1}, {"a": 2}, {"a": 3}]}]}]}
+        assert _count_rows(payload) == 3
+
+    def test_empty_rows(self):
+        payload = {"results": [{"tables": [{"rows": []}]}]}
+        assert _count_rows(payload) == 0
+
+    def test_malformed_returns_zero(self):
+        assert _count_rows({}) == 0
+        assert _count_rows({"results": []}) == 0
+        assert _count_rows({"results": [{}]}) == 0
+
+
+class TestExecuteDaxQuery:
+    SAMPLE_PAYLOAD = {
+        "results": [{"tables": [{"rows": [{"x": 1}, {"x": 2}]}]}]
+    }
+
+    @patch("src.api_client.requests.Session")
+    def test_success_returns_duration_and_rows(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = self.SAMPLE_PAYLOAD
+        mock_response.raise_for_status.return_value = None
+        mock_session.post.return_value = mock_response
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            result = client.execute_dax_query("ws-1", "ds-1", 'EVALUATE ROW("x", 1)')
+
+        assert result["row_count"] == 2
+        assert isinstance(result["duration_ms"], float)
+        assert result["duration_ms"] >= 0
+        # Verify the POST body carried the DAX query.
+        _, kwargs = mock_session.post.call_args
+        assert kwargs["json"]["queries"][0]["query"] == 'EVALUATE ROW("x", 1)'
+
+    @patch("src.api_client.requests.Session")
+    def test_raises_on_http_error(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = requests.HTTPError()
+        mock_session.post.return_value = mock_response
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(requests.HTTPError):
+                client.execute_dax_query("ws-1", "ds-1", "EVALUATE ROW(\"x\", 1)")
+
+
+class TestGetActivityEvents:
+    @patch("src.api_client.requests.Session")
+    def test_single_page(self, mock_session_cls):
+        mock_session = MagicMock()
+        page = MagicMock()
+        page.json.return_value = {
+            "activityEventEntities": [{"Id": "e1"}, {"Id": "e2"}],
+            "continuationToken": None,
+            "continuationUri": None,
+        }
+        page.raise_for_status.return_value = None
+        mock_session.get.return_value = page
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            events = client.get_activity_events(
+                "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+            )
+
+        assert [e["Id"] for e in events] == ["e1", "e2"]
+        assert mock_session.get.call_count == 1
+        # Verify the date params are single-quoted per the API contract.
+        _, kwargs = mock_session.get.call_args
+        assert kwargs["params"]["startDateTime"] == "'2024-06-01T00:00:00'"
+
+    @patch("src.api_client.requests.Session")
+    def test_follows_continuation_token(self, mock_session_cls):
+        mock_session = MagicMock()
+
+        page1 = MagicMock()
+        page1.json.return_value = {
+            "activityEventEntities": [{"Id": "e1"}],
+            "continuationToken": "tok",
+            "continuationUri": "https://api.powerbi.com/next",
+        }
+        page1.raise_for_status.return_value = None
+
+        page2 = MagicMock()
+        page2.json.return_value = {
+            "activityEventEntities": [{"Id": "e2"}],
+            "continuationToken": None,
+            "continuationUri": None,
+        }
+        page2.raise_for_status.return_value = None
+
+        mock_session.get.side_effect = [page1, page2]
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            events = client.get_activity_events(
+                "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+            )
+
+        assert [e["Id"] for e in events] == ["e1", "e2"]
+        assert mock_session.get.call_count == 2
+
+    @patch("src.api_client.requests.Session")
+    def test_safe_returns_empty_on_403(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_session.get.side_effect = requests.HTTPError(response=mock_response)
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            events = client.get_activity_events_safe(
+                "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+            )
+
+        assert events == []
+
+    @patch("src.api_client.requests.Session")
+    def test_safe_raises_on_unexpected_error(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_session.get.side_effect = requests.HTTPError(response=mock_response)
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(requests.HTTPError):
+                client.get_activity_events_safe(
+                    "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+                )
+
+
+class TestRateLimitHelpers:
+    def test_extracts_only_rate_limit_headers(self):
+        headers = {
+            "Content-Type": "application/json",
+            "Retry-After": "60",
+            "RateLimit-Remaining": "0",
+            "x-ms-throttle-scope": "tenant",
+            "X-RateLimit-Limit": "200",
+        }
+        found = _rate_limit_headers(headers)
+        assert found == {
+            "Retry-After": "60",
+            "RateLimit-Remaining": "0",
+            "x-ms-throttle-scope": "tenant",
+            "X-RateLimit-Limit": "200",
+        }
+
+    def test_parse_retry_after_seconds(self):
+        assert _parse_retry_after({"Retry-After": "120"}) == 120
+
+    def test_parse_retry_after_missing_or_non_numeric(self):
+        assert _parse_retry_after({}) is None
+        # HTTP-date form is not delta-seconds; we only parse integer seconds.
+        assert _parse_retry_after({"Retry-After": "Wed, 21 Oct 2025 07:28:00 GMT"}) is None
+
+
+class TestActivityEventsThrottling:
+    def _throttled_response(self, retry_after="300"):
+        resp = MagicMock()
+        resp.status_code = 429
+        resp.headers = {"Retry-After": retry_after, "x-ms-throttle-scope": "tenant"}
+        return resp
+
+    @patch("src.api_client.requests.Session")
+    def test_429_raises_rate_limit_error(self, mock_session_cls):
+        mock_session = MagicMock()
+        mock_session.get.return_value = self._throttled_response("300")
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(RateLimitError) as exc_info:
+                client.get_activity_events(
+                    "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+                )
+
+        assert exc_info.value.retry_after == 300
+
+    @patch("src.api_client.requests.Session")
+    def test_safe_does_not_swallow_rate_limit(self, mock_session_cls):
+        # Throttling must propagate (not return []) so the caller stops and the
+        # watermark is preserved - no silent data gaps.
+        mock_session = MagicMock()
+        mock_session.get.return_value = self._throttled_response("60")
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(RateLimitError):
+                client.get_activity_events_safe(
+                    "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+                )
+
+    @patch("src.api_client.requests.Session")
+    def test_429_on_continuation_page_raises(self, mock_session_cls):
+        mock_session = MagicMock()
+        page1 = MagicMock()
+        page1.status_code = 200
+        page1.json.return_value = {
+            "activityEventEntities": [{"Id": "e1"}],
+            "continuationToken": "tok",
+            "continuationUri": "https://api.powerbi.com/next",
+        }
+        page1.raise_for_status.return_value = None
+        mock_session.get.side_effect = [page1, self._throttled_response("30")]
+        mock_session_cls.return_value = mock_session
+
+        with PowerBIClient(access_token="test-token") as client:
+            client._session = mock_session
+            with pytest.raises(RateLimitError) as exc_info:
+                client.get_activity_events(
+                    "2024-06-01T00:00:00", "2024-06-01T23:59:59"
+                )
+
+        assert exc_info.value.retry_after == 30
+        assert mock_session.get.call_count == 2

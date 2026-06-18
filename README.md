@@ -34,26 +34,34 @@ The pipeline:
 powerbi-refresh-monitor/
 ├── config/
 │   ├── datasets.json          # Registry of monitored workspaces/datasets
-│   ├── pipeline_config.json   # Pipeline settings (table name, API params, alerting)
+│   ├── query_probes.json      # Registry of response-time probes (DAX per dataset)
+│   ├── pipeline_config.json   # Pipeline settings (table names, API params, alerting)
 │   └── workflow_job.json      # Databricks Workflow job definition
 ├── notebooks/
-│   ├── run_pipeline.py        # Main pipeline notebook (daily execution)
+│   ├── run_pipeline.py        # Refresh-history pipeline notebook (daily execution)
+│   ├── run_query_probe.py     # Response-time probe notebook (daily execution)
+│   ├── run_usage_pipeline.py  # Usage/Activity Events notebook (daily execution)
 │   ├── setup_table.py         # One-time Delta table creation
 │   └── sample_queries.sql     # Analytical SQL queries
 ├── src/
 │   ├── __init__.py
 │   ├── auth.py                # OAuth2 token acquisition via MSAL
-│   ├── api_client.py          # Power BI REST API client with retry logic
+│   ├── api_client.py          # Power BI REST API client (refresh, discovery, executeQueries)
 │   ├── transform.py           # JSON → structured row transformation
-│   ├── delta_ops.py           # Delta table DDL, upsert, and watermark queries
+│   ├── delta_ops.py           # Delta table DDL, upsert, append, and watermark queries
 │   ├── discovery.py           # Workspace-level dataset auto-discovery
+│   ├── query_probe.py         # Active response-time probing (Execute Queries)
+│   ├── usage.py               # Activity Events date-window helpers (incremental)
 │   └── alerts.py              # Post-ingestion alerting framework
 ├── tests/
 │   ├── __init__.py
 │   ├── test_auth.py
 │   ├── test_api_client.py
 │   ├── test_discovery.py
-│   └── test_transform.py
+│   ├── test_query_probe.py
+│   ├── test_usage.py
+│   ├── test_transform.py
+│   └── rate_limit_probe.py    # Standalone live rate-limit / throttling diagnostic
 ├── requirements.txt
 ├── .gitignore
 └── README.md
@@ -140,6 +148,82 @@ Use `config/workflow_job.json` as the job definition:
 - Via API: `POST /api/2.1/jobs/create` with the JSON payload.
 
 Update the `notebook_path` and `email_notifications` fields before deploying.
+
+## Response-Time Probing (no Log Analytics required)
+
+Measuring report/query response time normally requires Azure Log Analytics, which adds a
+usage-based Azure cost and requires Premium/Fabric capacity. As a **near-zero-cost
+alternative**, this repo includes an **active query probe** that measures response time
+directly:
+
+- `notebooks/run_query_probe.py` runs a small, **representative DAX query** against each
+  configured dataset via the **Execute Queries** REST API and records the round-trip
+  duration in the `powerbi_query_performance` Delta table.
+- Cost is just a few seconds of Databricks compute per run — **no per-GB ingestion charges**.
+- Because the same query runs identically each time, you get a clean **apples-to-apples
+  trend** ("did this report get slower over the last 6 weeks?").
+
+### Setup
+1. Have a Power BI admin enable the **"Dataset Execute Queries REST API"** tenant setting
+   for your Service Principal (a permission toggle — **not** a cost), and ensure the SP has
+   dataset access.
+2. Populate `config/query_probes.json` with one entry per dataset to probe, each with a
+   `query_label` and a lightweight `dax_query`. Keep the query identical run-to-run for
+   trend comparison.
+3. Set `query_performance_table.catalog`/`schema` in `config/pipeline_config.json`.
+4. Run `notebooks/run_query_probe.py` (it creates the table on first run). Schedule it
+   daily — or more frequently for finer-grained trends — via a Databricks Workflow.
+
+**Trade-off vs. Log Analytics:** the probe measures a query *you* define, not every real
+user query, so it is a controlled benchmark rather than full real-user telemetry. It is the
+recommended primary method for response-time trending; Log Analytics remains an optional
+later upgrade if full per-user query telemetry is needed.
+
+## Usage Tracking (Activity Events)
+
+Tracks **report/dashboard usage and popularity** — most-used reports, least-used / unused
+reports, and per-user view counts — from the Power BI **Activity Events** (audit) API.
+
+- `notebooks/run_usage_pipeline.py` pulls activity events one UTC day at a time, normalizes
+  them, and MERGEs into the `powerbi_activity_events` Delta table (keyed on `event_id`, so
+  re-runs never duplicate).
+- **Incremental & retention-aware:** the Activity Events API retains only **~28 days** of
+  history, so the pipeline runs day-by-day over a bounded window and re-fetches only the most
+  recent days (via a `creation_date` watermark). **Run it daily** so every run banks another
+  day into Delta — building the long-term history the API itself won't keep.
+- Optionally filter to specific activities (e.g. `["ViewReport", "ViewDashboard"]`) via
+  `usage.tracked_activities`, or leave it `null` to ingest all event types.
+
+### Setup
+1. Have a Power BI admin enable the **"Allow service principals to use read-only admin APIs"**
+   tenant setting and scope it to the Service Principal's security group (an admin-API
+   permission toggle — **not** a cost). This is separate from the standard "call Fabric public
+   APIs" setting used by the refresh pipeline.
+2. Set `activity_events_table.catalog`/`schema` and the `usage` block in
+   `config/pipeline_config.json`.
+3. Run `notebooks/run_usage_pipeline.py` (it creates the table on first run). Schedule it
+   daily via a Databricks Workflow.
+
+> **Unused-report detection:** combining this usage data with a report inventory (Metadata
+> Scanner) lets you flag reports that *exist but are never viewed*. The inventory scan is a
+> planned future addition.
+
+## API Rate Limits & Throttling
+
+The endpoints this project uses are governed by **different** quotas:
+
+| Endpoint | Used by | Limit type |
+|---|---|---|
+| `GET /groups`, `GET .../refreshes` | discovery, refresh history | General per-principal API throttle (~200 req/hr); 1 cheap call per dataset |
+| `POST .../executeQueries` | response-time probe | Per-principal; not auto-retried (a retry would inflate the timing) |
+| `GET /admin/activityevents` | usage tracking | **Admin API: tight ~200 req/hr quota, shared tenant-wide**, and multiplied by continuation-token pagination |
+
+**How throttling is handled:**
+- All GETs share a session that auto-retries on `429/5xx` and **honors the `Retry-After` header** (`api.max_retries`, `api.backoff_factor`).
+- A 429 that survives retries is logged with all rate-limit headers and raised as `RateLimitError` (not swallowed). Because activity events are fetched **oldest-first**, the usage pipeline stops on the throttled day and merges everything older — the `creation_date` watermark is preserved and the next run resumes from there, so **no days are silently skipped**.
+- `usage.max_backfill_days_per_run` caps how many days the initial ~28-day backfill loads per run, keeping it under the admin quota; re-run (or let the daily schedule run) until caught up.
+
+**Measuring the real limits:** `tests/rate_limit_probe.py` is a standalone diagnostic that bursts each endpoint with the Service Principal credentials and reports where the first `429` appears, the exact `Retry-After`, and all rate-limit headers — writing a JSON report. It is **opt-in for the admin endpoint** (`--include-admin`) and capped (`--max-requests`) so discovering the limit doesn't itself exhaust the tenant-wide admin quota. See the file header for usage.
 
 ## Local Development & Testing
 
