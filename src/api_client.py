@@ -5,6 +5,8 @@ Handles HTTP session management, retry logic with exponential backoff,
 and per-dataset refresh history retrieval.
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from typing import Any
