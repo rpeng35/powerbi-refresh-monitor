@@ -1,12 +1,18 @@
 """
 Demo script — shows what data the pipeline extracts and how it is structured.
 Run from the project root:  python demo_output.py
-No API credentials or Databricks connection required.
+
+For a LIVE activityevents API call (sections 4-6), set these env vars first:
+  set POWERBI_TENANT_ID=<your-tenant-id>
+  set POWERBI_CLIENT_ID=<your-client-id>
+  set POWERBI_CLIENT_SECRET=<your-client-secret>
+Without them, realistic sample data is used instead.
 """
 
 import json
 import sys
 import os
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -15,6 +21,7 @@ from src.transform import (
     transform_activity_events,
     filter_records_by_watermark,
 )
+from src.usage import day_bounds
 
 DIVIDER = "=" * 70
 
@@ -105,46 +112,75 @@ for r in filtered:
 # ---------------------------------------------------------------------------
 section("4. RAW Activity Events  (what the admin activityevents API returns)")
 
-raw_events = [
-    {
-        "Id": "evt-001",
-        "CreationTime": "2024-06-10T13:45:00Z",
-        "Activity": "ViewReport",
-        "UserId": "alice@contoso.com",
-        "WorkspaceId": "f089354e-8366-4e18-aea3-4cb4a3a50b48",
-        "WorkspaceName": "Finance Reports",
-        "ReportId": "rpt-xyz-111",
-        "ReportName": "Monthly Revenue Dashboard",
-        "DatasetId": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
-        "DatasetName": "Monthly Revenue Model",
-        "ResultStatus": "Succeeded",
-    },
-    {
-        "Id": "evt-002",
-        "CreationTime": "2024-06-10T14:10:00Z",
-        "Activity": "ViewReport",
-        "UserId": "bob@contoso.com",
-        "WorkspaceId": "f089354e-8366-4e18-aea3-4cb4a3a50b48",
-        "WorkspaceName": "Finance Reports",
-        "ReportId": "rpt-xyz-111",
-        "ReportName": "Monthly Revenue Dashboard",
-        "DatasetId": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
-        "DatasetName": "Monthly Revenue Model",
-        "ResultStatus": "Succeeded",
-    },
-    {
-        "Id": "evt-003",
-        "CreationTime": "2024-06-10T15:00:00Z",
-        "Activity": "CreateReport",
-        "UserId": "charlie@contoso.com",
-        "WorkspaceId": "f089354e-8366-4e18-aea3-4cb4a3a50b48",
-        "WorkspaceName": "Finance Reports",
-        "ReportName": "New Expense Report",
-    },
-]
+TENANT_ID = os.environ.get("POWERBI_TENANT_ID")
+CLIENT_ID = os.environ.get("POWERBI_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("POWERBI_CLIENT_SECRET")
 
-print(json.dumps(raw_events[0], indent=2))
-print("  ... (2 more events)")
+if TENANT_ID and CLIENT_ID and CLIENT_SECRET:
+    print("\n  Credentials found — calling live activityevents API...")
+    from src.auth import PowerBIAuthenticator
+    from src.api_client import PowerBIClient
+
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    start_dt, end_dt = day_bounds(yesterday)
+    print(f"  Fetching events for: {yesterday}  ({start_dt}  →  {end_dt})")
+
+    authenticator = PowerBIAuthenticator(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
+    token = authenticator.get_access_token()
+
+    with PowerBIClient(access_token=token) as client:
+        raw_events = client.get_activity_events(start_dt, end_dt)
+
+    print(f"\n  Total events returned by API: {len(raw_events)}")
+    if raw_events:
+        print(f"\n  First raw event (full API payload):")
+        print(json.dumps(raw_events[0], indent=2))
+        if len(raw_events) > 1:
+            print(f"  ... ({len(raw_events) - 1} more events)")
+    else:
+        print("  No events returned for yesterday — the tenant may have no activity or the SP lacks admin API access.")
+else:
+    print("\n  No credentials in environment — using sample data.")
+    print("  To use live data, set: POWERBI_TENANT_ID, POWERBI_CLIENT_ID, POWERBI_CLIENT_SECRET")
+    raw_events = [
+        {
+            "Id": "evt-001",
+            "CreationTime": "2024-06-10T13:45:00Z",
+            "Activity": "ViewReport",
+            "UserId": "alice@contoso.com",
+            "WorkspaceId": "f089354e-8366-4e18-aea3-4cb4a3a50b48",
+            "WorkspaceName": "Finance Reports",
+            "ReportId": "rpt-xyz-111",
+            "ReportName": "Monthly Revenue Dashboard",
+            "DatasetId": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+            "DatasetName": "Monthly Revenue Model",
+            "ResultStatus": "Succeeded",
+        },
+        {
+            "Id": "evt-002",
+            "CreationTime": "2024-06-10T14:10:00Z",
+            "Activity": "ViewReport",
+            "UserId": "bob@contoso.com",
+            "WorkspaceId": "f089354e-8366-4e18-aea3-4cb4a3a50b48",
+            "WorkspaceName": "Finance Reports",
+            "ReportId": "rpt-xyz-111",
+            "ReportName": "Monthly Revenue Dashboard",
+            "DatasetId": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+            "DatasetName": "Monthly Revenue Model",
+            "ResultStatus": "Succeeded",
+        },
+        {
+            "Id": "evt-003",
+            "CreationTime": "2024-06-10T15:00:00Z",
+            "Activity": "CreateReport",
+            "UserId": "charlie@contoso.com",
+            "WorkspaceId": "f089354e-8366-4e18-aea3-4cb4a3a50b48",
+            "WorkspaceName": "Finance Reports",
+            "ReportName": "New Expense Report",
+        },
+    ]
+    print(json.dumps(raw_events[0], indent=2))
+    print("  ... (2 more events)")
 
 # ---------------------------------------------------------------------------
 section("5. TRANSFORMED Activity Events  (all event types)")
