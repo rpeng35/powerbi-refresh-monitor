@@ -369,16 +369,17 @@ class PowerBIClient:
             On non-retryable HTTP errors (401/403 when the read-only admin API
             tenant setting is not enabled for the service principal).
         """
-        url = f"{BASE_URL}/admin/activityevents"
-        params = {
-            "startDateTime": f"'{start_datetime}'",
-            "endDateTime": f"'{end_datetime}'",
-        }
+        # The API requires literal single-quotes around the timestamps in the URL.
+        # Using params= causes requests to percent-encode them (%27), which the
+        # API rejects with HTTP 400, so we embed them directly in the URL string.
+        url = (
+            f"{BASE_URL}/admin/activityevents"
+            f"?startDateTime='{start_datetime}'&endDateTime='{end_datetime}'"
+        )
 
         response = self._session.get(
             url,
             headers=self._headers,
-            params=params,
             timeout=self._request_timeout,
         )
         _raise_if_throttled(response, f"activityevents [{start_datetime}]")
