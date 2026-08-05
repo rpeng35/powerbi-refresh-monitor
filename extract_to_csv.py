@@ -19,10 +19,15 @@ PowerShell:
   python extract_to_csv.py
 """
 
+import argparse
 import csv
+import logging
 import os
 import sys
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+
+logging.basicConfig(level=logging.ERROR, format="%(name)s %(levelname)s: %(message)s")
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -53,6 +58,40 @@ ACTIVITY_END_DATE   = None   # e.g. "2026-06-30"  (YYYY-MM-DD), or None = yester
 LOOKBACK_DAYS       = 7      # used only when ACTIVITY_START_DATE is None
 
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Argument parsing — CLI args override the config block above when provided
+# ---------------------------------------------------------------------------
+_parser = argparse.ArgumentParser(
+    description="Extract Power BI data to local CSV files.",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog="""
+examples:
+  # rolling last 7 days (uses config block defaults)
+  python extract_to_csv.py
+
+  # specific date range
+  python extract_to_csv.py --start-date 2026-06-10 --end-date 2026-06-30
+
+  # specific workspace, last 14 days
+  python extract_to_csv.py --workspace-id f089354e-8366-4e18-aea3-4cb4a3a50b48 --lookback-days 14
+""",
+)
+_parser.add_argument("--workspace-id",  default=None, help="Power BI workspace (group) UUID")
+_parser.add_argument("--dataset-id",   default=None, help="Dataset UUID (omit to discover all in workspace)")
+_parser.add_argument("--dataset-name", default=None, help="Friendly dataset name shown in logs")
+_parser.add_argument("--start-date",   default=None, metavar="YYYY-MM-DD", help="Activity events start date")
+_parser.add_argument("--end-date",     default=None, metavar="YYYY-MM-DD", help="Activity events end date (default: yesterday)")
+_parser.add_argument("--lookback-days",default=None, type=int, metavar="N", help="Rolling lookback days when --start-date is not set")
+_args = _parser.parse_args()
+
+# Merge: CLI arg wins over config block value when explicitly provided
+WORKSPACE_ID        = _args.workspace_id   or WORKSPACE_ID
+DATASET_ID          = _args.dataset_id     or DATASET_ID
+DATASET_NAME        = _args.dataset_name   or DATASET_NAME
+ACTIVITY_START_DATE = _args.start_date     or ACTIVITY_START_DATE
+ACTIVITY_END_DATE   = _args.end_date       or ACTIVITY_END_DATE
+LOOKBACK_DAYS       = _args.lookback_days  or LOOKBACK_DAYS
 
 # Credentials stay as env vars (never hard-code secrets)
 TENANT_ID     = os.environ.get("POWERBI_TENANT_ID")
@@ -92,6 +131,20 @@ def read_existing_ids(filename: str, id_field: str) -> set:
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         return {row[id_field] for row in reader if id_field in row}
+
+
+def read_all_activity_ids(id_field: str) -> set:
+    """Scan all activity_events_*.csv files in OUTPUT_DIR for existing IDs."""
+    existing: set = set()
+    for fname in os.listdir(OUTPUT_DIR):
+        if fname.startswith("activity_events_") and fname.endswith(".csv"):
+            existing |= read_existing_ids(fname, id_field)
+    return existing
+
+
+def activity_filename(year: int, month: int) -> str:
+    """Return the monthly CSV filename, e.g. activity_events_2026_06.csv."""
+    return f"activity_events_{year}_{month:02d}.csv"
 
 
 def log(msg: str):
@@ -184,10 +237,11 @@ else:
     date_range = [today - timedelta(days=offset) for offset in range(LOOKBACK_DAYS, 0, -1)]
     log(f"Fetching activity events for the last {LOOKBACK_DAYS} day(s)...")
 
-existing_ids = read_existing_ids("activity_events.csv", "event_id")
-log(f"  {len(existing_ids)} existing event(s) already in CSV (will skip duplicates).")
+existing_ids = read_all_activity_ids("event_id")
+log(f"  {len(existing_ids)} existing event(s) across all monthly files (will skip duplicates).")
 
-new_event_rows = []
+# Collect new rows grouped by (year, month) for monthly file splitting
+monthly_buckets: dict = defaultdict(list)
 
 with PowerBIClient(access_token=token) as client:
     for target_date in date_range:
@@ -200,19 +254,17 @@ with PowerBIClient(access_token=token) as client:
 
         rows = transform_activity_events(raw_events)
         new_rows = [r for r in rows if r.get("event_id") not in existing_ids]
-        new_event_rows.extend(new_rows)
         existing_ids.update(r["event_id"] for r in new_rows if r.get("event_id"))
         log(f"  {target_date}: {len(raw_events)} raw events → {len(new_rows)} new after dedup")
 
-if new_event_rows:
-    activity_path = os.path.join(OUTPUT_DIR, "activity_events.csv")
-    file_exists = os.path.isfile(activity_path)
-    written = write_csv(
-        "activity_events.csv",
-        new_event_rows,
-        mode="a" if file_exists else "w",
-    )
-    log(f"Saved {written} new event(s) → output/activity_events.csv")
+        for row in new_rows:
+            monthly_buckets[(target_date.year, target_date.month)].append(row)
+
+if monthly_buckets:
+    for (year, month), rows in sorted(monthly_buckets.items()):
+        fname = activity_filename(year, month)
+        written = write_csv(fname, rows, mode="a" if os.path.isfile(os.path.join(OUTPUT_DIR, fname)) else "w")
+        log(f"Saved {written} new event(s) → output/{fname}")
 else:
     log("No new activity events to save.")
 
@@ -222,13 +274,14 @@ else:
 print("\n" + "=" * 60)
 print("  EXTRACTION COMPLETE")
 print("=" * 60)
-for fname in ["refresh_history.csv", "activity_events.csv"]:
+summary_files = ["refresh_history.csv"] + sorted(
+    f for f in os.listdir(OUTPUT_DIR) if f.startswith("activity_events_") and f.endswith(".csv")
+)
+for fname in summary_files:
     path = os.path.join(OUTPUT_DIR, fname)
     if os.path.isfile(path):
         with open(path, newline="", encoding="utf-8") as f:
             row_count = sum(1 for _ in f) - 1
         size_kb = os.path.getsize(path) / 1024
-        print(f"  {fname:<30} {row_count:>6} rows   {size_kb:.1f} KB")
-    else:
-        print(f"  {fname:<30}  (not created)")
+        print(f"  {fname:<40} {row_count:>6} rows   {size_kb:.1f} KB")
 print(f"\n  Files saved to: {OUTPUT_DIR}")
